@@ -3,10 +3,12 @@ import dataclasses
 import json
 import logging
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from inline_snapshot import snapshot
-from mcp.types import CallToolResult, ImageContent, TextContent, Tool as MCPTool
+from mcp.shared.exceptions import McpError
+from mcp.types import CallToolResult, ErrorData, ImageContent, TextContent, Tool as MCPTool
 from pydantic import BaseModel, TypeAdapter
 
 import agents._debug as _debug
@@ -111,7 +113,46 @@ async def test_get_all_function_tools_duplicate_error_is_deterministic():
     with pytest.raises(UserError) as exc_info:
         await MCPUtil.get_all_function_tools([server1, server2], False, run_context, agent)
 
-    assert str(exc_info.value) == "Duplicate tool names found across MCP servers: alpha, zeta"
+    assert str(exc_info.value) == (
+        "Duplicate tool names found across MCP servers: alpha, zeta. "
+        "Pass `include_server_in_tool_names=True` to "
+        "`MCPUtil.get_all_function_tools()` or set "
+        "`mcp_config={'include_server_in_tool_names': True}` on the "
+        "agent to prefix tool names with their server name and avoid "
+        "collisions."
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_all_function_tools_duplicate_error_without_hint_when_prefixed():
+    """When include_server_in_tool_names is already enabled, duplicates should
+    not suggest enabling the same option again.
+    """
+    server1 = FakeMCPServer(server_name="server_1")
+    server1.add_tool("alpha", {})
+
+    server2 = FakeMCPServer(server_name="server_2")
+    server2.add_tool("beta", {})
+
+    run_context = RunContextWrapper(context=None)
+    agent = Agent(name="test_agent", instructions="Test agent")
+
+    def _return_colliding_names(server_tool_batches, *, reserved_names):
+        return {(0, 0): "mcp_same__tool", (1, 0): "mcp_same__tool"}
+
+    with patch.object(
+        MCPUtil, "_build_prefixed_tool_name_overrides", side_effect=_return_colliding_names
+    ):
+        with pytest.raises(UserError) as exc_info:
+            await MCPUtil.get_all_function_tools(
+                [server1, server2],
+                False,
+                run_context,
+                agent,
+                include_server_in_tool_names=True,
+            )
+
+    assert str(exc_info.value) == "Duplicate tool names found across MCP servers: mcp_same__tool"
 
 
 @pytest.mark.asyncio
@@ -767,6 +808,100 @@ async def test_mcp_invocation_crash_causes_error(caplog: pytest.LogCaptureFixtur
         await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
 
     assert "Error invoking MCP tool test_tool_1" in caplog.text
+
+
+class SecretCrashingFakeMCPServer(FakeMCPServer):
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+    ):
+        raise Exception("crash with SECRET_CRASH_123")
+
+
+class McpErrorFakeMCPServer(FakeMCPServer):
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        meta: dict[str, Any] | None = None,
+    ):
+        raise McpError(ErrorData(code=-32000, message="upstream said SECRET_MCP_123"))
+
+
+@pytest.mark.asyncio
+async def test_mcp_invocation_crash_redacts_error_when_dont_log_tool_data(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", True)
+
+    server = SecretCrashingFakeMCPServer()
+    server.add_tool("test_tool_1", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="test_tool_1", inputSchema={})
+
+    with pytest.raises(AgentsException):
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
+
+    assert "Error invoking MCP tool test_tool_1" in caplog.text
+    assert "SECRET_CRASH_123" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_invocation_crash_includes_error_when_tool_logging_enabled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
+
+    server = SecretCrashingFakeMCPServer()
+    server.add_tool("test_tool_1", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="test_tool_1", inputSchema={})
+
+    with pytest.raises(AgentsException):
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
+
+    assert "SECRET_CRASH_123" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_returned_error_redacts_message_when_dont_log_tool_data(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", True)
+
+    server = McpErrorFakeMCPServer()
+    server.add_tool("test_tool_1", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="test_tool_1", inputSchema={})
+
+    with pytest.raises(McpError):
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
+
+    assert "MCP tool test_tool_1 on server" in caplog.text
+    assert "SECRET_MCP_123" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_returned_error_includes_message_when_tool_logging_enabled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
+
+    server = McpErrorFakeMCPServer()
+    server.add_tool("test_tool_1", {})
+    ctx = RunContextWrapper(context=None)
+    tool = MCPTool(name="test_tool_1", inputSchema={})
+
+    with pytest.raises(McpError):
+        await MCPUtil.invoke_mcp_tool(server, tool, ctx, "")
+
+    assert "SECRET_MCP_123" in caplog.text
 
 
 @pytest.mark.asyncio

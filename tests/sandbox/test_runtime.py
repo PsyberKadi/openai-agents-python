@@ -25,6 +25,7 @@ from agents.guardrail import GuardrailFunctionOutput, InputGuardrail, OutputGuar
 from agents.items import ModelResponse, ToolCallOutputItem, TResponseInputItem
 from agents.model_settings import ModelSettings
 from agents.prompts import GenerateDynamicPromptData, Prompt
+from agents.result import RunResult, RunResultStreaming
 from agents.run import CallModelData, ModelInputData, RunConfig
 from agents.run_context import AgentHookContext, RunContextWrapper
 from agents.run_state import RunState, _build_agent_identity_map
@@ -201,6 +202,12 @@ class _LiveSessionDeltaRecorder(_FakeSession):
             self._fail_entry_batch_times -= 1
             raise RuntimeError("delta apply failed")
         return []
+
+
+class _RejectingLiveSessionDeltaRecorder(_LiveSessionDeltaRecorder):
+    async def _validate_manifest_application(self, *, only_ephemeral: bool = False) -> None:
+        _ = only_ephemeral
+        raise RuntimeError("live manifest update rejected")
 
 
 class _PathGuardingSession(_FakeSession):
@@ -787,6 +794,30 @@ class _ProcessContextSessionCapability(Capability):
         ]
 
 
+class _DropContextTextCapability(Capability):
+    type: str = "drop-context-text"
+    text: str
+
+    def __init__(self, text: str) -> None:
+        super().__init__(type="drop-context-text", **cast(Any, {"text": text}))
+
+    def process_context(self, context: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        return [item for item in context if self.text not in json.dumps(item, default=str)]
+
+
+class _RebuildContextWithoutPrivateMetadataCapability(Capability):
+    type: str = "rebuild-context-without-private-metadata"
+
+    def __init__(self) -> None:
+        super().__init__(type="rebuild-context-without-private-metadata")
+
+    def process_context(self, context: list[TResponseInputItem]) -> list[TResponseInputItem]:
+        return [
+            cast(TResponseInputItem, dict(item)) if isinstance(item, dict) else item
+            for item in context
+        ]
+
+
 class _SessionFileCapability(Capability):
     type: str = "session-files"
     bound_session: BaseSandboxSession | None = None
@@ -1220,9 +1251,9 @@ async def test_runner_adds_remote_mount_policy_instructions() -> None:
     expected_policy_pattern = expected_policy_pattern.replace(
         re.escape("{edit_instructions}"),
         re.escape(
-            "Use `apply_patch` directly for text edits. "
-            "For shell-based edits, first `cp` the mounted file to a normal local workspace "
-            "path, edit the local copy there, then `cp` it back. "
+            "Do not edit paths marked read-only in place, including with `apply_patch`, "
+            "and do not write edited files back to them. Copy read-only files to a normal "
+            "local workspace path only if you need an editable scratch copy."
         ),
     )
     assert isinstance(re.search(expected_policy_pattern, system_instructions), re.Match)
@@ -1338,10 +1369,10 @@ async def test_runner_marks_writable_remote_mounts_in_policy() -> None:
     system_instructions = model.first_turn_args["system_instructions"]
     assert isinstance(system_instructions, str)
     assert "- /workspace/remote (mounted in read+write mode)" in system_instructions
-    assert "Use `apply_patch` directly for text edits." in system_instructions
+    assert "Use `apply_patch` directly for text edits on read+write mounts." in system_instructions
     assert (
-        "For shell-based edits, first `cp` the mounted file to a normal local workspace path, "
-        "edit the local copy there, then `cp` it back." in system_instructions
+        "For shell-based edits on read+write mounts, first `cp` the mounted file to a normal "
+        "local workspace path, edit the local copy there, then copy it back." in system_instructions
     )
 
 
@@ -1827,6 +1858,95 @@ async def test_runner_rebuilds_sandbox_resources_for_handoff_target_agent() -> N
         "Worker workspace\n\n"
         f"{runtime_agent_preparation_module._filesystem_instructions(worker_manifest)}"
     )
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["non_streamed", "streamed"])
+@pytest.mark.asyncio
+async def test_context_rewrite_releases_removed_nested_history_ownership(streamed: bool) -> None:
+    triage_model = FakeModel()
+    worker_model = FakeModel(initial_output=[get_final_output_message("done")])
+    client = _ManifestSessionClient()
+    worker = SandboxAgent(
+        name="worker",
+        model=worker_model,
+        default_manifest=Manifest(),
+        capabilities=[_DropContextTextCapability("handoff message")],
+    )
+    triage = SandboxAgent(
+        name="triage",
+        model=triage_model,
+        default_manifest=Manifest(),
+        capabilities=[],
+        handoffs=[worker],
+    )
+    triage_model.turn_outputs = [
+        [get_final_output_message("handoff message"), get_handoff_tool_call(worker)]
+    ]
+    run_config = RunConfig(
+        sandbox=SandboxRunConfig(client=client),
+        nest_handoff_history=True,
+    )
+
+    result: RunResult | RunResultStreaming
+    if streamed:
+        result = Runner.run_streamed(triage, "route this", run_config=run_config)
+        async for _ in result.stream_events():
+            pass
+    else:
+        result = await Runner.run(triage, "route this", run_config=run_config)
+
+    replay_texts = [
+        _extract_user_text(cast(dict[str, object], item))
+        for item in result.to_input_list()
+        if isinstance(item, dict) and "content" in item
+    ]
+    assert replay_texts.count("handoff message") == 1
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["non_streamed", "streamed"])
+@pytest.mark.asyncio
+async def test_context_rebuild_retains_unambiguous_nested_history_ownership(
+    streamed: bool,
+) -> None:
+    triage_model = FakeModel()
+    worker_model = FakeModel(initial_output=[get_final_output_message("done")])
+    client = _ManifestSessionClient()
+    worker = SandboxAgent(
+        name="worker",
+        model=worker_model,
+        default_manifest=Manifest(),
+        capabilities=[_RebuildContextWithoutPrivateMetadataCapability()],
+    )
+    triage = SandboxAgent(
+        name="triage",
+        model=triage_model,
+        default_manifest=Manifest(),
+        capabilities=[],
+        handoffs=[worker],
+    )
+    triage_model.turn_outputs = [
+        [get_final_output_message("handoff message"), get_handoff_tool_call(worker)]
+    ]
+    run_config = RunConfig(
+        sandbox=SandboxRunConfig(client=client),
+        nest_handoff_history=True,
+    )
+
+    result: RunResult | RunResultStreaming
+    if streamed:
+        result = Runner.run_streamed(triage, "route this", run_config=run_config)
+        async for _ in result.stream_events():
+            pass
+    else:
+        result = await Runner.run(triage, "route this", run_config=run_config)
+
+    replay_texts = [
+        _extract_user_text(cast(dict[str, object], item))
+        for item in result.to_input_list()
+        if isinstance(item, dict) and "content" in item
+    ]
+    assert replay_texts.count("handoff message") == 1
+    assert result._nested_history_owned_session_item_refs
 
 
 @pytest.mark.asyncio
@@ -3259,6 +3379,31 @@ async def test_session_manager_materializes_running_injected_session_manifest_mu
 
 
 @pytest.mark.asyncio
+async def test_session_manager_validates_running_manifest_update_before_materialization() -> None:
+    inner = _RejectingLiveSessionDeltaRecorder(Manifest())
+    inner._running = True
+    live_session = SandboxSession(inner)
+    capability = _ManifestMutationCapability()
+    agent = SandboxAgent(name="worker", model=FakeModel(), instructions="Worker.")
+    manager = SandboxRuntimeSessionManager(
+        starting_agent=agent,
+        sandbox_config=SandboxRunConfig(session=live_session),
+        run_state=None,
+    )
+
+    manager.acquire_agent(agent)
+    with pytest.raises(RuntimeError, match="live manifest update rejected"):
+        await manager.ensure_session(
+            agent=agent,
+            capabilities=[capability],
+            is_resumed_state=False,
+        )
+
+    assert inner.applied_entry_batches == []
+    assert live_session.state.manifest.entries == {}
+
+
+@pytest.mark.asyncio
 async def test_session_manager_retries_running_injected_session_delta_apply_after_failure() -> None:
     live_session = _LiveSessionDeltaRecorder(Manifest(), fail_entry_batch_times=1)
     live_session._running = True
@@ -3917,6 +4062,115 @@ def test_unix_local_confined_exec_command_allows_common_darwin_interpreter_roots
     )
     assert '(deny file-write* (subpath "/opt"))' in profile
     assert '(allow file-write* (subpath "/opt/homebrew"))' not in profile
+
+
+def test_unix_local_confined_exec_command_allows_python_virtual_environment_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    host_project_root = tmp_path / "host-project"
+    virtual_env_root = host_project_root / ".venv"
+    virtual_env_bin = virtual_env_root / "bin"
+    virtual_env_bin.mkdir(parents=True)
+    (virtual_env_root / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    python_executable = virtual_env_bin / "python"
+    python_executable.write_text("", encoding="utf-8")
+    session = UnixLocalSandboxSession.from_state(
+        UnixLocalSandboxSessionState(
+            session_id=uuid.uuid4(),
+            manifest=_unix_local_manifest(root=str(workspace_root)),
+            snapshot=NoopSnapshot(id="darwin-virtual-environment"),
+            workspace_root_owned=False,
+        )
+    )
+    unix_local = cast(Any, unix_local_module)
+    path_env = str(virtual_env_bin)
+
+    def _fake_which(name: str, path: str | None = None) -> str | None:
+        if name == "sandbox-exec":
+            return "/usr/bin/sandbox-exec"
+        if name == "python":
+            assert path == path_env
+            return str(python_executable)
+        return None
+
+    monkeypatch.setattr(unix_local.sys, "platform", "darwin")
+    monkeypatch.setattr(unix_local.shutil, "which", _fake_which)
+    monkeypatch.setenv("PATH", path_env)
+
+    command = session._confined_exec_command(
+        command_parts=["python", "-V"],
+        workspace_root=workspace_root,
+        env={"PATH": path_env},
+    )
+    profile_lines = set(command[2].splitlines())
+
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{virtual_env_root}"))' in profile_lines
+    )
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{host_project_root}"))'
+        not in profile_lines
+    )
+    assert f'(allow file-write* (subpath "{virtual_env_root}"))' not in profile_lines
+
+
+def test_unix_local_confined_exec_command_does_not_expand_manifest_virtual_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    host_project_root = tmp_path / "host-project"
+    virtual_env_root = host_project_root / ".venv"
+    virtual_env_bin = virtual_env_root / "bin"
+    virtual_env_bin.mkdir(parents=True)
+    (virtual_env_root / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    python_executable = virtual_env_bin / "python"
+    python_executable.write_text("", encoding="utf-8")
+    session = UnixLocalSandboxSession.from_state(
+        UnixLocalSandboxSessionState(
+            session_id=uuid.uuid4(),
+            manifest=_unix_local_manifest(root=str(workspace_root)),
+            snapshot=NoopSnapshot(id="darwin-manifest-virtual-environment"),
+            workspace_root_owned=False,
+        )
+    )
+    unix_local = cast(Any, unix_local_module)
+    manifest_path = str(virtual_env_bin)
+
+    def _fake_which(name: str, path: str | None = None) -> str | None:
+        if name == "sandbox-exec":
+            return "/usr/bin/sandbox-exec"
+        if name == "python":
+            assert path == manifest_path
+            return str(python_executable)
+        return None
+
+    monkeypatch.setattr(unix_local.sys, "platform", "darwin")
+    monkeypatch.setattr(unix_local.shutil, "which", _fake_which)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    command = session._confined_exec_command(
+        command_parts=["python", "-V"],
+        workspace_root=workspace_root,
+        env={"PATH": manifest_path},
+    )
+    profile_lines = set(command[2].splitlines())
+
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{virtual_env_bin}"))' in profile_lines
+    )
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{virtual_env_root}"))'
+        not in profile_lines
+    )
+    assert (
+        f'(allow file-read-data file-read-metadata (subpath "{host_project_root}"))'
+        not in profile_lines
+    )
 
 
 def test_unix_local_darwin_exec_profile_allows_extra_path_grants(tmp_path: Path) -> None:

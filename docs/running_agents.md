@@ -155,7 +155,8 @@ Use `RunConfig` to override behavior for a single run without changing each agen
 ##### Tool execution, approval, and tool error behavior
 
 -   [`tool_execution`][agents.run.RunConfig.tool_execution]: Configure SDK-side execution behavior for local tool calls, such as limiting how many function tools run at once.
--   [`tool_error_formatter`][agents.run.RunConfig.tool_error_formatter]: Customize the model-visible message when a tool call is rejected during approval flows.
+-   [`tool_not_found_behavior`][agents.run.RunConfig.tool_not_found_behavior]: Configure how the runner handles unresolved function tool calls emitted by the model. The default raises `ModelBehaviorError`; opt in to return a model-visible error output instead.
+-   [`tool_error_formatter`][agents.run.RunConfig.tool_error_formatter]: Customize model-visible tool error messages, such as approval rejections and opt-in tool-not-found outputs.
 
 Nested handoffs are available as an opt-in beta. Enable the collapsed-transcript behavior by passing `RunConfig(nest_handoff_history=True)` or set `handoff(..., nest_handoff_history=True)` to turn it on for a specific handoff. If you prefer to keep the raw transcript (the default), leave the flag unset or provide a `handoff_input_filter` (or `handoff_history_mapper`) that forwards the conversation exactly as you need. To change the wrapper text used in the generated summary without writing a custom mapper, call [`set_conversation_history_wrappers`][agents.handoffs.set_conversation_history_wrappers] (and [`reset_conversation_history_wrappers`][agents.handoffs.reset_conversation_history_wrappers] to restore the defaults).
 
@@ -163,7 +164,7 @@ Nested handoffs are available as an opt-in beta. Enable the collapsed-transcript
 
 ##### `tool_execution`
 
-Use `tool_execution` when you want the SDK to limit local function-tool concurrency for a run.
+Use `tool_execution` when you want to configure SDK-side behavior for local function tools, such as limiting local function-tool concurrency for a run.
 
 ```python
 from agents import Agent, RunConfig, Runner, ToolExecutionConfig
@@ -174,7 +175,10 @@ result = await Runner.run(
     agent,
     "Run the required tool calls.",
     run_config=RunConfig(
-        tool_execution=ToolExecutionConfig(max_function_tool_concurrency=2),
+        tool_execution=ToolExecutionConfig(
+            max_function_tool_concurrency=2,
+            pre_approval_tool_input_guardrails=True,
+        ),
     ),
 )
 ```
@@ -183,13 +187,35 @@ result = await Runner.run(
 
 This is separate from provider-side [`ModelSettings.parallel_tool_calls`][agents.model_settings.ModelSettings.parallel_tool_calls]. `parallel_tool_calls` controls whether the model is allowed to emit multiple tool calls in a single response. `tool_execution.max_function_tool_concurrency` controls how the SDK executes local function tool calls after the model has emitted them.
 
+`pre_approval_tool_input_guardrails=False` preserves the default approval flow: if a function tool needs approval, the run pauses first and the tool input guardrails run only after approval, immediately before execution. Set it to `True` when you want function-tool input guardrails to run before the pending approval interruption is emitted. Calls that pass this pre-approval check still run the same input guardrails again after approval, so time-sensitive checks are revalidated before execution.
+
+##### `tool_not_found_behavior`
+
+By default, if the model emits a function tool call that does not match any function tool available to the current agent, the runner raises `ModelBehaviorError`.
+
+Set `tool_not_found_behavior="return_error_to_model"` when you want the run to remain recoverable. In that mode, the SDK appends a `function_call_output` for the unresolved tool call and runs the model again, so the model can choose an available tool or answer without using that tool.
+
+```python
+from agents import Agent, RunConfig, Runner
+
+agent = Agent(name="Assistant", tools=[...])
+
+result = await Runner.run(
+    agent,
+    "Handle this request with the available tools.",
+    run_config=RunConfig(tool_not_found_behavior="return_error_to_model"),
+)
+```
+
+This option currently applies to unresolved function tool calls only. Other invalid tool payloads continue to use their existing error behavior.
+
 ##### `tool_error_formatter`
 
-Use `tool_error_formatter` to customize the message that is returned to the model when a tool call is rejected in an approval flow.
+Use `tool_error_formatter` to customize the message that is returned to the model when the SDK creates a model-visible tool error output.
 
 The formatter receives [`ToolErrorFormatterArgs`][agents.run_config.ToolErrorFormatterArgs] with:
 
--   `kind`: The error category. Today this is `"approval_rejected"`.
+-   `kind`: The error category, such as `"approval_rejected"` or `"tool_not_found"`.
 -   `tool_type`: The tool runtime (`"function"`, `"computer"`, `"shell"`, `"apply_patch"`, or `"custom"`).
 -   `tool_name`: The tool name.
 -   `call_id`: The tool call ID.
@@ -208,6 +234,8 @@ def format_rejection(args: ToolErrorFormatterArgs[None]) -> str | None:
             f"Tool call '{args.tool_name}' was rejected by a human reviewer. "
             "Ask for confirmation or propose a safer alternative."
         )
+    if args.kind == "tool_not_found":
+        return f"Tool '{args.tool_name}' is not available. Choose one of the listed tools."
     return None
 
 
@@ -263,7 +291,7 @@ There are four common ways to carry state into the next turn:
 
 Calling any of the run methods can result in one or more agents running (and hence one or more LLM calls), but it represents a single logical turn in a chat conversation. For example:
 
-1. User turn: user enter text
+1. User turn: user enters text
 2. Runner run: first agent calls LLM, runs tools, does a handoff to a second agent, second agent runs more tools, and then produces an output.
 
 At the end of the agent run, you can choose what to show to the user. For example, you might show the user every new item generated by the agents, or just the final output. Either way, the user might then ask a followup question, in which case you can call the run method again.
@@ -273,6 +301,8 @@ At the end of the agent run, you can choose what to show to the user. For exampl
 You can manually manage conversation history using the [`RunResultBase.to_input_list()`][agents.result.RunResultBase.to_input_list] method to get the inputs for the next turn:
 
 ```python
+from agents import Agent, Runner, trace
+
 async def main():
     agent = Agent(name="Assistant", instructions="Reply very concisely.")
 
@@ -295,7 +325,7 @@ async def main():
 For a simpler approach, you can use [Sessions](sessions/index.md) to automatically handle conversation history without manually calling `.to_input_list()`:
 
 ```python
-from agents import Agent, Runner, SQLiteSession
+from agents import Agent, Runner, SQLiteSession, trace
 
 async def main():
     agent = Agent(name="Assistant", instructions="Reply very concisely.")
@@ -381,9 +411,7 @@ async def main():
         print(f"Assistant: {result.final_output}")
 ```
 
-If a run pauses for approval and you resume from a [`RunState`][agents.run_state.RunState], the
-SDK keeps the saved `conversation_id` / `previous_response_id` / `auto_previous_response_id`
-settings so the resumed turn continues in the same server-managed conversation.
+If a run pauses for approval and you resume from a [`RunState`][agents.run_state.RunState], the SDK keeps the saved `conversation_id` / `previous_response_id` / `auto_previous_response_id` settings so the resumed turn continues in the same server-managed conversation.
 
 `conversation_id` and `previous_response_id` are mutually exclusive. Use `conversation_id` when you want a named conversation resource that can be shared across systems. Use `previous_response_id` when you want the lightest Responses API continuation primitive from one turn to the next.
 
@@ -437,7 +465,7 @@ Set the hook per run via `run_config` to redact sensitive data, trim long histor
 
 ### Error handlers
 
-All `Runner` entry points accept `error_handlers`, a dict keyed by error kind. The supported keys are `"max_turns"` and `"model_refusal"`. Use them when you want to return a controlled final output instead of raising `MaxTurnsExceeded` or `ModelRefusalError`.
+All `Runner` entry points accept `error_handlers`, a dict keyed by error kind. The supported keys are `"max_turns"`, `"model_refusal"`, and `"invalid_final_output"`. Use them when you want to return a controlled final output instead of ending the run with the corresponding error.
 
 ```python
 from agents import (
@@ -462,6 +490,38 @@ result = Runner.run_sync(
     "Analyze this long transcript",
     max_turns=3,
     error_handlers={"max_turns": on_max_turns},
+)
+print(result.final_output)
+```
+
+Use `"invalid_final_output"` when a model message does not validate against the agent's structured `output_type`, or when the model returns no structured final message. The handler can return an application-specific fallback, which the SDK validates against the same `output_type`. It does not retry the model call or replay any tool side effects. Returning `None` declines recovery. Without a fallback, non-empty validation failures continue to raise `ModelBehaviorError`, and empty structured responses retain the existing next-turn behavior.
+
+```python
+from pydantic import BaseModel
+
+from agents import Agent, ModelBehaviorError, RunErrorHandlerInput, Runner
+
+
+class Recipe(BaseModel):
+    ingredients: list[str]
+    recovered_from_invalid_output: bool = False
+
+
+def on_invalid_final_output(data: RunErrorHandlerInput[None]) -> Recipe:
+    assert isinstance(data.error, ModelBehaviorError)
+    return Recipe(ingredients=[], recovered_from_invalid_output=True)
+
+
+agent = Agent(
+    name="Recipe assistant",
+    instructions="Return a structured recipe.",
+    output_type=Recipe,
+)
+
+result = Runner.run_sync(
+    agent,
+    "Plan tonight's dinner.",
+    error_handlers={"invalid_final_output": on_invalid_final_output},
 )
 print(result.final_output)
 ```
@@ -502,8 +562,7 @@ print(result.final_output)
 
 ## Durable execution integrations and human-in-the-loop
 
-For tool approval pause/resume patterns, start with the dedicated [Human-in-the-loop guide](human_in_the_loop.md).
-The integrations below are for durable orchestration when runs may span long waits, retries, or process restarts.
+For tool approval pause/resume patterns, start with the dedicated [Human-in-the-loop guide](human_in_the_loop.md). The integrations below are for durable orchestration when runs may span long waits, retries, or process restarts.
 
 ### Dapr
 
@@ -515,12 +574,11 @@ You can use the Agents SDK [Temporal](https://temporal.io/) integration to run d
 
 ### Restate
 
-You can use the Agents SDK [Restate](https://restate.dev/) integration for lightweight, durable agents, including human approval, handoffs, and session management. The integration requires Restate's single-binary runtime as a dependency, and supports running agents as processes/containers or serverless functions.
-Read the [overview](https://www.restate.dev/blog/durable-orchestration-for-ai-agents-with-restate-and-openai-sdk) or view the [docs](https://docs.restate.dev/ai) for more details.
+You can use the Agents SDK [Restate](https://restate.dev/) integration for lightweight, durable agents, including human approval, handoffs, and session management. The integration requires Restate's single-binary runtime as a dependency, and supports running agents as processes/containers or serverless functions. Read the [overview](https://www.restate.dev/blog/durable-orchestration-for-ai-agents-with-restate-and-openai-sdk) or view the [docs](https://docs.restate.dev/ai) for more details.
 
 ### DBOS
 
-You can use the Agents SDK [DBOS](https://dbos.dev/) integration to run reliable agents that preserves progress across failures and restarts. It supports long-running agents, human-in-the-loop workflows, and handoffs. It supports both sync and async methods. The integration requires only a SQLite or Postgres database. View the integration [repo](https://github.com/dbos-inc/dbos-openai-agents) and the [docs](https://docs.dbos.dev/integrations/openai-agents) for more details.
+You can use the Agents SDK [DBOS](https://dbos.dev/) integration to run reliable agents that preserve progress across failures and restarts. It supports long-running agents, human-in-the-loop workflows, and handoffs. It supports both sync and async methods. The integration requires only a SQLite or Postgres database. View the integration [repo](https://github.com/dbos-inc/dbos-openai-agents) and the [docs](https://docs.dbos.dev/integrations/openai-agents) for more details.
 
 ## Exceptions
 

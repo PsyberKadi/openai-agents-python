@@ -7,8 +7,9 @@ import hashlib
 import inspect
 import json
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, Union
 
 import httpx
@@ -39,6 +40,7 @@ from ..tool import (
 )
 from ..tool_context import ToolContext
 from ..tracing import FunctionSpanData, get_current_span, mcp_tools_span
+from ..util._custom_data import maybe_extract_custom_data
 from ..util._types import MaybeAwaitable
 
 if TYPE_CHECKING:
@@ -149,13 +151,50 @@ class MCPToolMetaContext:
     """The parsed tool arguments."""
 
 
+@dataclass(frozen=True)
+class MCPToolCustomDataContext:
+    """Context passed to MCP tool custom data extractors."""
+
+    run_context: RunContextWrapper[Any]
+    """The current run context."""
+
+    server_name: str
+    """The name of the MCP server."""
+
+    tool_name: str
+    """The original MCP tool name invoked on the server."""
+
+    tool_display_name: str
+    """The public tool name exposed through the Agents SDK."""
+
+    arguments: Mapping[str, Any]
+    """The parsed tool arguments."""
+
+    result_meta: Mapping[str, Any] | None
+    """The MCP tool result ``_meta`` payload, if present."""
+
+    structured_content: Mapping[str, Any] | None
+    """The MCP tool result ``structuredContent`` payload, if present."""
+
+    is_error: bool | None
+    """The MCP tool result ``isError`` flag, if present."""
+
+    tool_output: ToolOutput
+    """The model-visible tool output produced by the Agents SDK."""
+
+
 if TYPE_CHECKING:
     MCPToolMetaResolver = Callable[
         [MCPToolMetaContext],
         MaybeAwaitable[dict[str, Any] | None],
     ]
+    MCPToolCustomDataExtractor = Callable[
+        [MCPToolCustomDataContext],
+        MaybeAwaitable[Mapping[str, Any] | None],
+    ]
 else:
     MCPToolMetaResolver = Callable[..., Any]
+    MCPToolCustomDataExtractor = Callable[..., Any]
 """A function that produces MCP request metadata for tool calls.
 
 Args:
@@ -164,6 +203,7 @@ Args:
 Returns:
     A dict to send as MCP `_meta`, or None to omit metadata.
 """
+"""A function that produces SDK-only custom data for MCP tool output items."""
 
 
 def create_static_tool_filter(
@@ -282,7 +322,12 @@ class MCPUtil:
             if duplicate_tool_names:
                 raise UserError(
                     "Duplicate tool names found across MCP servers: "
-                    f"{', '.join(duplicate_tool_names)}"
+                    f"{', '.join(duplicate_tool_names)}. "
+                    "Pass `include_server_in_tool_names=True` to "
+                    "`MCPUtil.get_all_function_tools()` or set "
+                    "`mcp_config={'include_server_in_tool_names': True}` on the "
+                    "agent to prefix tool names with their server name and avoid "
+                    "collisions."
                 )
             tool_names.update(server_tool_names)
             tools.extend(server_tools)
@@ -501,7 +546,7 @@ class MCPUtil:
                 schema = ensure_strict_json_schema(copy.deepcopy(schema))
                 is_strict = True
             except Exception as e:
-                logger.info(f"Error converting MCP schema to strict mode: {e}")
+                logger.info("Error converting MCP schema to strict mode: %s", e)
 
         needs_approval: (
             bool | Callable[[RunContextWrapper[Any], dict[str, Any], str], Awaitable[bool]]
@@ -540,6 +585,41 @@ class MCPUtil:
         if explicit_meta is not None:
             merged.update(copy.deepcopy(explicit_meta))
         return merged
+
+    @staticmethod
+    def _copy_mapping_proxy(value: Any) -> Mapping[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        return MappingProxyType(copy.deepcopy(value))
+
+    @classmethod
+    async def _extract_custom_data(
+        cls,
+        *,
+        server: MCPServer,
+        context: RunContextWrapper[Any],
+        tool_name: str,
+        tool_display_name: str,
+        arguments: dict[str, Any],
+        result: Any,
+        tool_output: ToolOutput,
+    ) -> dict[str, Any] | None:
+        extractor = getattr(server, "custom_data_extractor", None)
+        if extractor is None:
+            return None
+
+        extractor_context = MCPToolCustomDataContext(
+            run_context=context,
+            server_name=server.name,
+            tool_name=tool_name,
+            tool_display_name=tool_display_name,
+            arguments=MappingProxyType(copy.deepcopy(arguments)),
+            result_meta=cls._copy_mapping_proxy(getattr(result, "meta", None)),
+            structured_content=cls._copy_mapping_proxy(getattr(result, "structuredContent", None)),
+            is_error=getattr(result, "isError", None),
+            tool_output=copy.deepcopy(tool_output),
+        )
+        return await maybe_extract_custom_data(extractor, extractor_context)
 
     @classmethod
     async def _resolve_meta(
@@ -604,9 +684,9 @@ class MCPUtil:
             )
 
         if _debug.DONT_LOG_TOOL_DATA:
-            logger.debug(f"Invoking MCP tool {tool_name_for_display}")
+            logger.debug("Invoking MCP tool %s", tool_name_for_display)
         else:
-            logger.debug(f"Invoking MCP tool {tool_name_for_display} with input {input_json}")
+            logger.debug("Invoking MCP tool %s with input %s", tool_name_for_display, input_json)
 
         try:
             resolved_meta = await cls._resolve_meta(server, context, tool.name, json_data)
@@ -644,24 +724,44 @@ class MCPUtil:
                 # pipeline (failure_error_function) can handle it.  The default handler
                 # will surface the message as a structured error result; callers who set
                 # failure_error_function=None will have the error raised as documented.
-                error_text = e.error.message if hasattr(e, "error") and e.error else str(e)
-                logger.warning(
-                    f"MCP tool {tool_name_for_display} on server '{server.name}' "
-                    f"returned an error: {error_text}"
-                )
+                if _debug.DONT_LOG_TOOL_DATA:
+                    logger.warning(
+                        "MCP tool %s on server '%s' returned an error.",
+                        tool_name_for_display,
+                        server.name,
+                    )
+                else:
+                    error_text = e.error.message if hasattr(e, "error") and e.error else str(e)
+                    logger.warning(
+                        "MCP tool %s on server '%s' returned an error: %s",
+                        tool_name_for_display,
+                        server.name,
+                        error_text,
+                    )
                 raise
 
-            logger.error(
-                f"Error invoking MCP tool {tool_name_for_display} on server '{server.name}': {e}"
-            )
+            if _debug.DONT_LOG_TOOL_DATA:
+                logger.error(
+                    "Error invoking MCP tool %s on server '%s': %s",
+                    tool_name_for_display,
+                    server.name,
+                    e.__class__.__name__,
+                )
+            else:
+                logger.error(
+                    "Error invoking MCP tool %s on server '%s': %s",
+                    tool_name_for_display,
+                    server.name,
+                    e,
+                )
             raise AgentsException(
                 f"Error invoking MCP tool {tool_name_for_display} on server '{server.name}': {e}"
             ) from e
 
         if _debug.DONT_LOG_TOOL_DATA:
-            logger.debug(f"MCP tool {tool_name_for_display} completed.")
+            logger.debug("MCP tool %s completed.", tool_name_for_display)
         else:
-            logger.debug(f"MCP tool {tool_name_for_display} returned {result}")
+            logger.debug("MCP tool %s returned %s", tool_name_for_display, result)
 
         # If structured content is requested and available, use it exclusively
         tool_output: ToolOutput
@@ -688,6 +788,18 @@ class MCPUtil:
             else:
                 tool_output = tool_output_list
 
+        custom_data = await cls._extract_custom_data(
+            server=server,
+            context=context,
+            tool_name=tool.name,
+            tool_display_name=tool_name_for_display,
+            arguments=json_data,
+            result=result,
+            tool_output=tool_output,
+        )
+        if custom_data and isinstance(context, ToolContext):
+            context._custom_data = custom_data
+
         current_span = get_current_span()
         if current_span:
             if isinstance(current_span.span_data, FunctionSpanData):
@@ -700,7 +812,7 @@ class MCPUtil:
                 }
             else:
                 logger.warning(
-                    f"Current span is not a FunctionSpanData, skipping tool output: {current_span}"
+                    "Current span is not a FunctionSpanData, skipping tool output: %s", current_span
                 )
 
         return tool_output

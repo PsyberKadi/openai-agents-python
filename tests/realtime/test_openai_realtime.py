@@ -1,12 +1,13 @@
 import asyncio
 import json
-from datetime import datetime, timedelta
+import time
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import websockets
+from pydantic import TypeAdapter
 
 from agents import Agent, function_tool
 from agents.exceptions import UserError
@@ -16,6 +17,7 @@ from agents.realtime.model_events import (
     RealtimeModelAudioEvent,
     RealtimeModelErrorEvent,
     RealtimeModelToolCallEvent,
+    RealtimeModelUsageEvent,
 )
 from agents.realtime.model_inputs import (
     RealtimeModelSendAudio,
@@ -115,8 +117,8 @@ class TestConnectionLifecycle(TestOpenAIRealtimeWebSocketModel):
         assert model.model == "gpt-4o-realtime-preview"
 
     @pytest.mark.asyncio
-    async def test_connect_defaults_to_gpt_realtime_2(self, model, mock_websocket):
-        """Test that connect() uses gpt-realtime-2 when no model is provided."""
+    async def test_connect_defaults_to_gpt_realtime_2_1(self, model, mock_websocket):
+        """Test that connect() uses gpt-realtime-2.1 when no model is provided."""
         config = {
             "api_key": "test-api-key-123",
             "initial_model_settings": {},
@@ -139,8 +141,8 @@ class TestConnectionLifecycle(TestOpenAIRealtimeWebSocketModel):
 
                 mock_connect.assert_called_once()
                 call_args = mock_connect.call_args
-                assert call_args[0][0] == "wss://api.openai.com/v1/realtime?model=gpt-realtime-2"
-                assert model.model == "gpt-realtime-2"
+                assert call_args[0][0] == "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1"
+                assert model.model == "gpt-realtime-2.1"
 
         assert model._websocket_task is not None
 
@@ -446,6 +448,191 @@ class TestEventHandlingRobustness(TestOpenAIRealtimeWebSocketModel):
         assert error_event.type == "error"
 
     @pytest.mark.asyncio
+    async def test_handle_invalid_event_schema_redacts_payload_from_logs(self, model, monkeypatch):
+        """Test that invalid event logs omit payload data when model data logging is disabled."""
+        mock_listener = AsyncMock()
+        model.add_listener(mock_listener)
+        monkeypatch.setattr(
+            "agents.realtime.openai_realtime._debug.DONT_LOG_MODEL_DATA",
+            True,
+        )
+
+        invalid_event = {
+            "type": "response.output_audio.delta",
+            "event_id": "evt_123",
+            "delta": "secret transcript",
+        }
+
+        with patch("agents.realtime.openai_realtime.logger") as mock_logger:
+            await model._handle_ws_event(invalid_event)
+
+        mock_logger.error.assert_called_once()
+        logged_call = str(mock_logger.error.call_args)
+        assert "secret transcript" not in logged_call
+        assert "response.output_audio.delta" in logged_call
+        assert "evt_123" in logged_call
+        assert mock_logger.error.call_args.kwargs.get("exc_info") is not True
+
+        assert mock_listener.on_event.call_count == 2
+        error_event = mock_listener.on_event.call_args_list[1][0][0]
+        assert error_event.type == "error"
+
+    @pytest.mark.asyncio
+    async def test_send_raw_message_conversion_failure_redacts_payload_from_logs(
+        self, model, monkeypatch
+    ):
+        """A raw client message that fails to convert must not leak its payload to the logs
+        when model-data logging is disabled."""
+        monkeypatch.setattr(
+            "agents.realtime.openai_realtime._debug.DONT_LOG_MODEL_DATA",
+            True,
+        )
+        raw = RealtimeModelSendRawMessage(
+            message={
+                "type": "invalid.event.type",
+                "other_data": {"transcript": "secret transcript"},
+            }
+        )
+
+        with patch("agents.realtime.openai_realtime.logger") as mock_logger:
+            await model.send_event(raw)
+
+        mock_logger.error.assert_called_once()
+        logged_call = str(mock_logger.error.call_args)
+        assert "secret transcript" not in logged_call
+        assert "invalid.event.type" in logged_call
+
+    @pytest.mark.asyncio
+    async def test_custom_voice_response_events_update_response_sequencer(self, model, monkeypatch):
+        """Dict-shaped custom voices should not block response.create sequencing."""
+        payload_types: list[str] = []
+
+        async def fake_send_raw(event):
+            payload_types.append(event.type)
+
+        class CustomVoiceRejectingAdapter:
+            _string_adapter = TypeAdapter(str)
+
+            def validate_python(self, event):
+                voice = event.get("response", {}).get("audio", {}).get("output", {}).get("voice")
+                if isinstance(voice, dict):
+                    self._string_adapter.validate_python(voice)
+                if event["type"] == "response.done":
+                    return SimpleNamespace(type=event["type"], response=SimpleNamespace(usage=None))
+                return SimpleNamespace(type=event["type"])
+
+        monkeypatch.setattr(model, "_send_raw_message", fake_send_raw)
+        model._server_event_type_adapter = CustomVoiceRejectingAdapter()
+        mock_listener = AsyncMock()
+        model.add_listener(mock_listener)
+
+        await model._send_user_input(RealtimeModelSendUserInput(user_input="hi"))
+        await asyncio.sleep(0)
+
+        assert payload_types == ["conversation.item.create", "response.create"]
+        assert model._response_control == "create_requested"
+
+        response_with_custom_voice = {
+            "type": "response.created",
+            "response": {"audio": {"output": {"voice": {"id": "voice_test"}}}},
+        }
+        await model._handle_ws_event(response_with_custom_voice)
+
+        assert model._ongoing_response is True
+        assert model._response_control == "free"
+
+        await model._handle_ws_event(
+            {
+                "type": "response.done",
+                "response": {"audio": {"output": {"voice": {"id": "voice_test"}}}},
+            }
+        )
+
+        assert model._ongoing_response is False
+        assert model._response_control == "free"
+        raw_event = mock_listener.on_event.call_args_list[0][0][0]
+        assert raw_event.data is response_with_custom_voice
+        assert response_with_custom_voice["response"]["audio"]["output"]["voice"] == {
+            "id": "voice_test"
+        }
+
+        await model._send_tool_output(
+            RealtimeModelSendToolOutput(
+                tool_call=SimpleNamespace(
+                    id="item_1",
+                    previous_item_id=None,
+                    call_id="call_1",
+                    arguments="{}",
+                    name="lookup",
+                ),
+                output="ok",
+                start_response=True,
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert payload_types == [
+            "conversation.item.create",
+            "response.create",
+            "conversation.item.create",
+            "response.create",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_response_done_emits_typed_usage_before_turn_ended(self, model):
+        class ResponseDoneAdapter:
+            def validate_python(self, event):
+                usage = {
+                    "total_tokens": 20,
+                    "input_tokens": 12,
+                    "output_tokens": 8,
+                    "input_token_details": {
+                        "text_tokens": 2,
+                        "audio_tokens": 10,
+                        "cached_tokens": 4,
+                    },
+                    "output_token_details": {"text_tokens": 1, "audio_tokens": 7},
+                }
+                from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
+
+                return SimpleNamespace(
+                    type=event["type"],
+                    response=SimpleNamespace(usage=RealtimeResponseUsage.model_validate(usage)),
+                )
+
+        model._server_event_type_adapter = ResponseDoneAdapter()
+        mock_listener = AsyncMock()
+        model.add_listener(mock_listener)
+
+        await model._handle_ws_event(
+            {
+                "type": "response.done",
+                "response": {"status": "cancelled"},
+            }
+        )
+
+        emitted = [call.args[0] for call in mock_listener.on_event.call_args_list]
+        assert [event.type for event in emitted] == ["raw_server_event", "usage", "turn_ended"]
+        assert isinstance(emitted[1], RealtimeModelUsageEvent)
+        assert emitted[1].input_tokens_details is not None
+        assert emitted[1].input_tokens_details.audio_tokens == 10
+
+    @pytest.mark.asyncio
+    async def test_response_done_without_usage_skips_usage_event(self, model):
+        class ResponseDoneAdapter:
+            def validate_python(self, event):
+                return SimpleNamespace(type=event["type"], response=SimpleNamespace(usage=None))
+
+        model._server_event_type_adapter = ResponseDoneAdapter()
+        mock_listener = AsyncMock()
+        model.add_listener(mock_listener)
+
+        await model._handle_ws_event({"type": "response.done", "response": {}})
+
+        emitted = [call.args[0] for call in mock_listener.on_event.call_args_list]
+        assert [event.type for event in emitted] == ["raw_server_event", "turn_ended"]
+
+    @pytest.mark.asyncio
     async def test_handle_unknown_event_type_ignored(self, model):
         """Test that unknown event types are ignored gracefully."""
         mock_listener = AsyncMock()
@@ -500,6 +687,35 @@ class TestEventHandlingRobustness(TestOpenAIRealtimeWebSocketModel):
         audio_state = model._audio_state_tracker.get_state("item_456", 0)
         assert audio_state is not None
         assert audio_state.audio_length_ms > 0  # Should have some audio length
+
+    @pytest.mark.asyncio
+    async def test_audio_delta_event_skips_custom_voice_normalization(self, model, monkeypatch):
+        """High-frequency audio delta events should not pay for custom voice normalization."""
+        mock_listener = AsyncMock()
+        model.add_listener(mock_listener)
+        model._audio_state_tracker.set_audio_format("pcm16")
+
+        def fail_normalize(event):
+            raise AssertionError("custom voice normalization should not run")
+
+        monkeypatch.setattr(
+            "agents.realtime.openai_realtime._normalize_custom_voice_for_server_event_validation",
+            fail_normalize,
+        )
+
+        await model._handle_ws_event(
+            {
+                "type": "response.output_audio.delta",
+                "event_id": "event_123",
+                "response_id": "resp_123",
+                "item_id": "item_456",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "dGVzdCBhdWRpbw==",
+            }
+        )
+
+        assert mock_listener.on_event.call_count == 2
 
     @pytest.mark.asyncio
     async def test_backward_compat_output_item_added_and_done(self, model):
@@ -681,7 +897,7 @@ class TestEventHandlingRobustness(TestOpenAIRealtimeWebSocketModel):
         model._audio_state_tracker.on_audio_delta("i1", 0, b"a" * 48_000)
         state = model._audio_state_tracker.get_state("i1", 0)
         assert state is not None
-        state.initial_received_time = datetime.now() - timedelta(seconds=5)
+        state.initial_received_time = time.monotonic() - 5
 
         monkeypatch.setattr(
             model,
@@ -712,7 +928,7 @@ class TestEventHandlingRobustness(TestOpenAIRealtimeWebSocketModel):
         model._audio_state_tracker.on_audio_delta("i1", 0, b"a" * 48_000)
         state = model._audio_state_tracker.get_state("i1", 0)
         assert state is not None
-        state.initial_received_time = datetime.now() - timedelta(seconds=5)
+        state.initial_received_time = time.monotonic() - 5
         model._ongoing_response = True
 
         monkeypatch.setattr(
@@ -1519,10 +1735,26 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
         assert cfg.audio is not None and cfg.audio.output is not None
         assert cfg.audio.output.voice == "verse"
 
+    def test_session_config_accepts_custom_voice_object(self, model):
+        custom_voice = {"id": "voice_test"}
+
+        cfg = model._get_session_config({"voice": custom_voice})
+        payload = cfg.model_dump(exclude_unset=True)
+
+        assert payload["audio"]["output"]["voice"] == custom_voice
+
+    def test_session_config_accepts_nested_custom_voice_object(self, model):
+        custom_voice = {"id": "voice_test"}
+
+        cfg = model._get_session_config({"audio": {"output": {"voice": custom_voice}}})
+        payload = cfg.model_dump(exclude_unset=True)
+
+        assert payload["audio"]["output"]["voice"] == custom_voice
+
     def test_session_config_defaults_audio_formats_when_not_call(self, model):
         settings: dict[str, Any] = {}
         cfg = model._get_session_config(settings)
-        assert cfg.model == "gpt-realtime-2"
+        assert cfg.model == "gpt-realtime-2.1"
         assert cfg.audio is not None
         assert cfg.audio.input is not None
         assert cfg.audio.input.format is not None
@@ -1539,7 +1771,7 @@ class TestSendEventAndConfig(TestOpenAIRealtimeWebSocketModel):
         cfg = model._get_session_config(settings)
         payload = cfg.model_dump(exclude_unset=True)
 
-        assert payload["model"] == "gpt-realtime-2"
+        assert payload["model"] == "gpt-realtime-2.1"
         assert payload["parallel_tool_calls"] is False
         assert payload["reasoning"] == {"effort": "low"}
 
@@ -2018,6 +2250,40 @@ class TestTransportIntegration:
                 await model.connect(config)
 
         assert captured_kwargs.get("open_timeout") == 0.75
+
+    @pytest.mark.asyncio
+    async def test_max_size_config_is_applied(self):
+        """Test that max_size is passed through to websockets.connect."""
+        captured_kwargs: dict[str, Any] = {}
+
+        async def capture_connect(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            mock_ws = AsyncMock()
+            mock_ws.close_code = None
+            return mock_ws
+
+        transport: TransportConfig = {
+            "max_size": 8 * 1024 * 1024,
+        }
+        model = OpenAIRealtimeWebSocketModel(transport_config=transport)
+        with patch("websockets.connect", side_effect=capture_connect):
+            with patch("asyncio.create_task") as mock_create_task:
+                mock_task = AsyncMock()
+
+                def mock_create_task_func(coro):
+                    coro.close()
+                    return mock_task
+
+                mock_create_task.side_effect = mock_create_task_func
+
+                config: RealtimeModelConfig = {
+                    "api_key": "test-key",
+                    "url": "ws://localhost:8080/v1/realtime",
+                    "initial_model_settings": {"model_name": "gpt-4o-realtime-preview"},
+                }
+                await model.connect(config)
+
+        assert captured_kwargs.get("max_size") == 8 * 1024 * 1024
 
     @pytest.mark.asyncio
     async def test_ping_timeout_disabled_vs_enabled(self):

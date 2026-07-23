@@ -53,9 +53,12 @@ from agents.run_internal.run_loop import (
     ToolRunShellCall,
     extract_tool_call_id,
 )
-from agents.run_internal.tool_planning import _select_function_tool_runs_for_resume
+from agents.run_internal.tool_planning import (
+    _collect_runs_by_approval,
+    _select_function_tool_runs_for_resume,
+)
 from agents.run_state import RunState as RunStateClass
-from agents.tool import HostedMCPTool
+from agents.tool import FunctionTool, HostedMCPTool
 from agents.usage import Usage
 
 from .fake_model import FakeModel
@@ -879,6 +882,91 @@ async def test_function_needs_approval_invalid_type_raises() -> None:
         await Runner.run(agent, "run invalid")
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"subject": "refund"',
+        "null",
+        "[]",
+        '{"amount": NaN}',
+        '{"amount": Infinity}',
+        '{"amount": -Infinity}',
+    ],
+)
+@pytest.mark.asyncio
+async def test_callable_function_approval_fails_closed_for_invalid_arguments(
+    arguments: str,
+) -> None:
+    """Uninspectable function arguments must require approval before a manual tool can run."""
+    approval_inputs: list[dict[str, Any]] = []
+    tool_inputs: list[str] = []
+
+    async def needs_approval(_ctx: Any, params: dict[str, Any], _call_id: str) -> bool:
+        approval_inputs.append(params)
+        return False
+
+    async def invoke_tool(_ctx: Any, raw_arguments: str) -> str:
+        tool_inputs.append(raw_arguments)
+        return "sent"
+
+    tool = FunctionTool(
+        name="send_email",
+        description="Send an email.",
+        params_json_schema={"type": "object", "properties": {}},
+        on_invoke_tool=invoke_tool,
+        needs_approval=needs_approval,
+    )
+    model, agent = make_model_and_agent(tools=[tool])
+    model.set_next_output(
+        [make_function_tool_call(tool.name, arguments=arguments, call_id="call-invalid")]
+    )
+
+    result = await Runner.run(agent, "send an email")
+
+    assert len(result.interruptions) == 1
+    assert result.interruptions[0].tool_name == tool.name
+    assert approval_inputs == []
+    assert tool_inputs == []
+
+
+@pytest.mark.asyncio
+async def test_callable_function_approval_receives_valid_object_arguments() -> None:
+    """Valid object arguments should preserve callable approval behavior."""
+    approval_inputs: list[dict[str, Any]] = []
+    tool_inputs: list[str] = []
+
+    async def needs_approval(_ctx: Any, params: dict[str, Any], _call_id: str) -> bool:
+        approval_inputs.append(params)
+        return False
+
+    async def invoke_tool(_ctx: Any, raw_arguments: str) -> str:
+        tool_inputs.append(raw_arguments)
+        return "sent"
+
+    tool = FunctionTool(
+        name="send_email",
+        description="Send an email.",
+        params_json_schema={"type": "object", "properties": {"subject": {"type": "string"}}},
+        on_invoke_tool=invoke_tool,
+        needs_approval=needs_approval,
+    )
+    arguments = '{"subject": "status update"}'
+    model, agent = make_model_and_agent(tools=[tool])
+    model.add_multiple_turn_outputs(
+        [
+            [make_function_tool_call(tool.name, arguments=arguments, call_id="call-valid")],
+            [get_text_message("done")],
+        ]
+    )
+
+    result = await Runner.run(agent, "send an email")
+
+    assert result.final_output == "done"
+    assert approval_inputs
+    assert all(params == {"subject": "status update"} for params in approval_inputs)
+    assert tool_inputs == [arguments]
+
+
 @pytest.mark.asyncio
 async def test_resume_invalid_needs_approval_raises() -> None:
     """Resume path should surface invalid needs_approval configuration errors."""
@@ -1303,6 +1391,69 @@ async def test_resume_skips_needs_approval_checker_when_status_resolved() -> Non
     assert checker_calls == []
     assert [run.tool_call.call_id for run in selected] == ["approved-call"]
     assert rejections == ["rejected-call"]
+
+
+@pytest.mark.asyncio
+async def test_collect_runs_by_approval_skips_checker_when_status_resolved() -> None:
+    """Approved/rejected shell calls must not invoke needs_approval_checker.
+
+    Mirrors #3229 for non-function tools: when the approval status is already
+    True or False, a user-supplied checker (which may have side effects, hit
+    the network, or raise) must be short-circuited.
+    """
+    shell_tool = ShellTool(executor=lambda _req: "ok", needs_approval=True)
+    approved_call = make_shell_call("approved-shell")
+    rejected_call = make_shell_call("rejected-shell")
+    agent = Agent(name="agent")
+    context_wrapper = make_context_wrapper()
+    context_wrapper.approve_tool(
+        ToolApprovalItem(
+            agent=agent,
+            raw_item=cast(dict[str, Any], approved_call),
+            tool_name=shell_tool.name,
+        )
+    )
+    context_wrapper.reject_tool(
+        ToolApprovalItem(
+            agent=agent,
+            raw_item=cast(dict[str, Any], rejected_call),
+            tool_name=shell_tool.name,
+        )
+    )
+
+    runs = [
+        ToolRunShellCall(tool_call=approved_call, shell_tool=shell_tool),
+        ToolRunShellCall(tool_call=rejected_call, shell_tool=shell_tool),
+    ]
+    checker_calls: list[str] = []
+
+    async def _needs_approval(run: ToolRunShellCall) -> bool:
+        checker_calls.append(run.tool_call["call_id"])
+        raise AssertionError("checker must not run for resolved approvals")
+
+    async def _build_rejection(run: ToolRunShellCall, call_id: str) -> RunItem:
+        return ToolCallOutputItem(
+            output="rejected",
+            raw_item={"type": "function_call_output", "call_id": call_id, "output": "rejected"},
+            agent=agent,
+        )
+
+    approved, rejections = await _collect_runs_by_approval(
+        runs,
+        call_id_extractor=lambda run: run.tool_call["call_id"],
+        tool_name_resolver=lambda run: run.shell_tool.name,
+        rejection_builder=_build_rejection,
+        context_wrapper=context_wrapper,
+        approval_items_by_call_id={},
+        agent=agent,
+        pending_interruption_adder=lambda _item: None,
+        needs_approval_checker=_needs_approval,
+        output_exists_checker=lambda _call_id: False,
+    )
+
+    assert checker_calls == []
+    assert approved == [runs[0]]
+    assert len(rejections) == 1
 
 
 @pytest.mark.asyncio

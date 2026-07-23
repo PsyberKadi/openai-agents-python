@@ -44,6 +44,7 @@ from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
+from ....sandbox.session.pty_output import collect_pty_output
 from ....sandbox.session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
@@ -52,7 +53,6 @@ from ....sandbox.session.pty_types import (
     clamp_pty_yield_time_ms,
     process_id_to_prune_from_meta,
     resolve_pty_write_yield_time_ms,
-    truncate_text_by_tokens,
 )
 from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
 from ....sandbox.session.sandbox_client import BaseSandboxClient
@@ -63,6 +63,7 @@ from ....sandbox.util.retry import (
     TRANSIENT_HTTP_STATUS_CODES,
     exception_chain_contains_type,
     exception_chain_has_status_code,
+    iter_exception_chain,
     retry_async,
 )
 from ....sandbox.util.tar_utils import UnsafeTarMemberError, validate_tar_bytes
@@ -70,6 +71,85 @@ from ....sandbox.workspace_paths import coerce_posix_path, posix_path_as_path, s
 
 DEFAULT_BLAXEL_WORKSPACE_ROOT = "/workspace"
 logger = logging.getLogger(__name__)
+
+
+# Blaxel documents structured API error codes and retryability at:
+# https://docs.blaxel.ai/troubleshooting/error-codes
+_BLAXEL_ERROR_CODE_RETRYABLE: dict[str, bool] = {
+    "ROUTE_NOT_FOUND": False,  # 404
+    "WORKLOAD_NOT_FOUND": False,  # 404
+    "WORKSPACE_NOT_FOUND": False,  # 404
+    "WORKLOAD_UNAVAILABLE": True,  # 404
+    "AUTHENTICATION_REQUIRED": False,  # 401
+    "AUTHENTICATION_FAILED": False,  # 401
+    "FORBIDDEN": False,  # 403
+    "BAD_REQUEST": False,  # 400
+    "USAGE_LIMIT_EXCEEDED": False,  # 402
+    "POLICY_VIOLATION": False,  # varies
+}
+
+
+def _coerce_mapping(value: object) -> dict[str, object] | None:
+    if isinstance(value, dict):
+        return {str(key): item for key, item in value.items()}
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(decoded, dict):
+            return {str(key): item for key, item in decoded.items()}
+    return None
+
+
+def _blaxel_error_payload(error: BaseException) -> dict[str, object] | None:
+    for candidate in iter_exception_chain(error):
+        for attr in ("body", "payload"):
+            payload = _coerce_mapping(getattr(candidate, attr, None))
+            if payload is not None:
+                return payload
+
+        response = getattr(candidate, "response", None)
+        response_json = getattr(response, "json", None)
+        if callable(response_json):
+            try:
+                payload = _coerce_mapping(response_json())
+            except Exception:
+                payload = None
+            if payload is not None:
+                return payload
+
+        response_text = getattr(response, "text", None)
+        payload = _coerce_mapping(response_text)
+        if payload is not None:
+            return payload
+
+    return None
+
+
+def _blaxel_structured_error(error: BaseException) -> dict[str, object] | None:
+    payload = _blaxel_error_payload(error)
+    if payload is None:
+        return None
+    nested = payload.get("error")
+    if isinstance(nested, dict):
+        return {str(key): value for key, value in nested.items()}
+    return payload
+
+
+def _blaxel_provider_retryability(error: BaseException) -> tuple[bool | None, str | None]:
+    structured_error = _blaxel_structured_error(error)
+    if structured_error is not None:
+        retryable = structured_error.get("retryable")
+        if isinstance(retryable, bool):
+            code = structured_error.get("code")
+            return retryable, str(code) if isinstance(code, str) and code else None
+
+        code = structured_error.get("code")
+        if isinstance(code, str):
+            return _BLAXEL_ERROR_CODE_RETRYABLE.get(code), code
+
+    return None, None
 
 
 def _blaxel_provider_error_detail(error: BaseException) -> str | None:
@@ -91,15 +171,26 @@ def _blaxel_exec_transport_error(
 ) -> ExecTransportError:
     detail = _blaxel_provider_error_detail(cause)
     context: dict[str, object] = {"backend": "blaxel"}
+    retryable, provider_error_code = _blaxel_provider_retryability(cause)
+    if provider_error_code is not None:
+        context["provider_error_code"] = provider_error_code
     if detail:
         context["provider_error"] = detail
     status = getattr(cause, "status_code", None) or getattr(cause, "status", None)
     if isinstance(status, int):
         context["http_status"] = status
+        if retryable is None and status in TRANSIENT_HTTP_STATUS_CODES:
+            retryable = True
     message = "Blaxel exec failed"
     if detail:
         message = f"{message}: {detail}"
-    return ExecTransportError(command=command, context=context, cause=cause, message=message)
+    return ExecTransportError(
+        command=command,
+        context=context,
+        cause=cause,
+        message=message,
+        retryable=retryable,
+    )
 
 
 def _import_blaxel_sdk() -> Any:
@@ -517,7 +608,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
                 return ExecResult(stdout=fallback_bytes, stderr=b"", exit_code=exit_code)
             return ExecResult(stdout=b"", stderr=fallback_bytes, exit_code=exit_code)
         except asyncio.TimeoutError as e:
-            raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
+            raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
         except (ExecTimeoutError, ExecTransportError):
             raise
         except Exception as e:
@@ -525,7 +616,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
             if api_error_cls is not None and isinstance(e, api_error_cls):
                 status = getattr(e, "status_code", None)
                 if status in (408, 504):
-                    raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
+                    raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
             raise _blaxel_exec_transport_error(command=command, cause=e) from e
 
     # -- running check -------------------------------------------------------
@@ -583,6 +674,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
                             "reason": "tar_failed",
                             "output": result.stderr.decode("utf-8", errors="replace"),
                         },
+                        retryable=False,
                     )
                 raw_data: Any = await self._sandbox.fs.read_binary(tar_path)
                 if isinstance(raw_data, str):
@@ -742,7 +834,7 @@ class BlaxelSandboxSession(BaseSandboxSession):
         except asyncio.TimeoutError as e:
             if not registered:
                 await self._terminate_pty_entry(entry)
-            raise ExecTimeoutError(command=command, timeout_s=timeout, cause=e) from e
+            raise ExecTimeoutError(command=command, timeout_s=exec_timeout, cause=e) from e
         except Exception as e:
             if not registered:
                 await self._terminate_pty_entry(entry)
@@ -867,34 +959,14 @@ class BlaxelSandboxSession(BaseSandboxSession):
         yield_time_ms: int,
         max_output_tokens: int | None,
     ) -> tuple[bytes, int | None]:
-        deadline = time.monotonic() + (yield_time_ms / 1000)
-        output = bytearray()
-
-        while True:
-            async with entry.output_lock:
-                while entry.output_chunks:
-                    output.extend(entry.output_chunks.popleft())
-
-            if time.monotonic() >= deadline:
-                break
-            if entry.done:
-                async with entry.output_lock:
-                    while entry.output_chunks:
-                        output.extend(entry.output_chunks.popleft())
-                break
-
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0:
-                break
-            try:
-                await asyncio.wait_for(entry.output_notify.wait(), timeout=remaining_s)
-            except asyncio.TimeoutError:
-                break
-            entry.output_notify.clear()
-
-        text = output.decode("utf-8", errors="replace")
-        truncated, original_token_count = truncate_text_by_tokens(text, max_output_tokens)
-        return truncated.encode("utf-8", errors="replace"), original_token_count
+        return await collect_pty_output(
+            output_chunks=entry.output_chunks,
+            output_lock=entry.output_lock,
+            output_notify=entry.output_notify,
+            is_done=lambda: entry.done,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
 
     async def _finalize_pty_update(
         self,

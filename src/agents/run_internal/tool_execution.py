@@ -6,6 +6,7 @@ approval plumbing, and payload coercion. Action classes live in tool_actions.py.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import functools
 import inspect
@@ -20,6 +21,7 @@ from openai.types.responses.response_input_item_param import (
 from openai.types.responses.response_input_param import McpApprovalResponse
 from openai.types.responses.response_output_item import McpApprovalRequest
 
+from .. import _debug
 from .._tool_identity import (
     FunctionToolLookupKey,
     NamedToolLookupKey,
@@ -65,6 +67,7 @@ from ..tool import (
     ComputerTool,
     ComputerToolSafetyCheckData,
     FunctionTool,
+    FunctionToolCustomDataContext,
     FunctionToolResult,
     ShellActionRequest,
     ShellCallData,
@@ -72,8 +75,11 @@ from ..tool import (
     ShellCommandOutput,
     Tool,
     ToolOrigin,
+    _computer_tool_uses_run_scoped_initializer,
+    _consume_function_tool_default_failure,
+    _invoke_function_tool_with_metadata,
+    _is_programmatic_tool_call,
     get_function_tool_origin,
-    invoke_function_tool,
     maybe_invoke_function_tool_failure_error_function,
     resolve_computer,
 )
@@ -86,7 +92,8 @@ from ..tool_guardrails import (
 )
 from ..tracing import Span, SpanError, function_span, get_current_trace
 from ..util import _coro, _error_tracing
-from ..util._approvals import evaluate_needs_approval_setting
+from ..util._approvals import evaluate_needs_approval_setting, parse_function_tool_arguments
+from ..util._custom_data import maybe_extract_custom_data, merge_custom_data
 from ..util._tool_errors import get_trace_tool_error
 from ..util._types import MaybeAwaitable
 from ._asyncio_progress import get_function_tool_task_progress_deadline
@@ -174,6 +181,14 @@ class _FunctionToolFailure:
     error: BaseException
     order: int
     source: _FunctionToolFailureSource = "direct"
+
+
+@dataclasses.dataclass(frozen=True)
+class _ToolOutputGuardrailExecutionResult:
+    """A tool output plus whether it was synthesized by a rejecting guardrail."""
+
+    output: Any
+    is_rejection: bool = False
 
 
 @dataclasses.dataclass
@@ -573,15 +588,27 @@ async def initialize_computer_tools(
     *,
     tools: list[Tool],
     context_wrapper: RunContextWrapper[Any],
-) -> None:
-    """Resolve computer tools ahead of model invocation so each run gets its own instance."""
+) -> list[Tool]:
+    """Resolve computer tools and return run-local copies for model invocation."""
     computer_tools = [tool for tool in tools if isinstance(tool, ComputerTool)]
     if not computer_tools:
-        return
+        return tools
 
-    await asyncio.gather(
+    run_scoped_tools = {
+        tool for tool in computer_tools if _computer_tool_uses_run_scoped_initializer(tool)
+    }
+
+    resolved_computers = await asyncio.gather(
         *(resolve_computer(tool=tool, run_context=context_wrapper) for tool in computer_tools)
     )
+    resolved_by_tool = dict(zip(computer_tools, resolved_computers, strict=True))
+
+    return [
+        dataclasses.replace(tool, computer=resolved_by_tool[tool])
+        if isinstance(tool, ComputerTool) and tool in run_scoped_tools
+        else tool
+        for tool in tools
+    ]
 
 
 def get_mapping_or_attr(target: Any, key: str) -> Any:
@@ -1013,6 +1040,19 @@ def format_shell_error(error: Exception | BaseException | Any) -> str:
         return repr(error)
 
 
+def log_tool_action_error(message: str, exc: Exception | BaseException) -> None:
+    """Log a tool-action failure without leaking tool data.
+
+    Tool exceptions can embed tool call arguments or output, so the exception is
+    redacted by default (matching ``_debug.DONT_LOG_TOOL_DATA``). The full exception
+    and traceback are logged only when tool-data logging is explicitly enabled.
+    """
+    if _debug.DONT_LOG_TOOL_DATA:
+        logger.error("%s: %s", message, exc.__class__.__name__)
+    else:
+        logger.error("%s: %s", message, exc, exc_info=True)
+
+
 async def with_tool_function_span(
     *,
     config: RunConfig,
@@ -1160,7 +1200,7 @@ async def resolve_approval_rejection_message(
         )
         message = await maybe_message if inspect.isawaitable(maybe_message) else maybe_message
     except Exception as exc:
-        logger.error("Tool error formatter failed for %s: %s", tool_name, exc)
+        log_tool_action_error(f"Tool error formatter failed for {tool_name}", exc)
         return REJECTION_MESSAGE
 
     if message is None:
@@ -1185,10 +1225,10 @@ async def function_needs_approval(
     """Evaluate a function tool's needs_approval setting with parsed args."""
     parsed_args: dict[str, Any] = {}
     if callable(function_tool.needs_approval):
-        try:
-            parsed_args = json.loads(tool_call.arguments or "{}")
-        except json.JSONDecodeError:
-            parsed_args = {}
+        parsed_args_result = parse_function_tool_arguments(tool_call.arguments)
+        if parsed_args_result is None:
+            return True
+        parsed_args = parsed_args_result
     needs_approval = await evaluate_needs_approval_setting(
         function_tool.needs_approval,
         context_wrapper,
@@ -1249,6 +1289,7 @@ def process_hosted_mcp_approvals(
             )
             if approved is False and rejection_message is not None:
                 raw_item["reason"] = rejection_message
+            ItemHelpers.copy_tool_call_caller(mcp_run.request_item, raw_item)
             response_item = MCPApprovalResponseItem(raw_item=raw_item, agent=agent)
             append_item(response_item)
             continue
@@ -1305,6 +1346,7 @@ def collect_manual_mcp_approvals(
             )
             if approval_status is False and rejection_message is not None:
                 approval_response_raw["reason"] = rejection_message
+            ItemHelpers.copy_tool_call_caller(request_item, approval_response_raw)
             approved.append(MCPApprovalResponseItem(raw_item=approval_response_raw, agent=agent))
             continue
 
@@ -1352,6 +1394,14 @@ def should_keep_hosted_mcp_item(
     )
 
 
+def _uses_programmatic_output_schema(
+    function_tool: FunctionTool,
+    tool_call: Any,
+) -> bool:
+    """Return whether this call must satisfy its advertised program output schema."""
+    return function_tool.output_json_schema is not None and _is_programmatic_tool_call(tool_call)
+
+
 class _FunctionToolBatchExecutor:
     """Own the mutable state needed to execute and arbitrate a function-tool batch."""
 
@@ -1380,6 +1430,8 @@ class _FunctionToolBatchExecutor:
         self.task_states: dict[asyncio.Task[Any], _FunctionToolTaskState] = {}
         self.teardown_cancelled_tasks: set[asyncio.Task[Any]] = set()
         self.results_by_tool_run: dict[int, Any] = {}
+        self.schema_bypassed_tool_runs: set[int] = set()
+        self.custom_data_by_tool_run: dict[int, dict[str, Any]] = {}
         self.pending_tasks: set[asyncio.Task[Any]] = set()
         self.propagating_failure: BaseException | None = None
         self.available_function_tools: list[FunctionTool] = []
@@ -1651,6 +1703,36 @@ class _FunctionToolBatchExecutor:
             tool_lookup_key=tool_lookup_key,
         )
         if approval_status is None:
+            if self._should_run_pre_approval_tool_input_guardrails():
+                tool_context_namespace = get_tool_call_namespace(raw_tool_call)
+                if tool_context_namespace is None:
+                    tool_context_namespace = get_tool_call_namespace(tool_call)
+                tool_context = ToolContext.from_agent_context(
+                    self.context_wrapper,
+                    tool_call.call_id,
+                    tool_call=raw_tool_call,
+                    tool_namespace=tool_context_namespace,
+                    agent=self.public_agent,
+                    run_config=self.config,
+                )
+                rejected_message = await _execute_tool_input_guardrails(
+                    func_tool=func_tool,
+                    tool_context=tool_context,
+                    agent=self.public_agent,
+                    tool_input_guardrail_results=self.tool_input_guardrail_results,
+                )
+                if rejected_message is not None:
+                    return FunctionToolResult(
+                        tool=func_tool,
+                        output=rejected_message,
+                        run_item=function_rejection_item(
+                            self.public_agent,
+                            tool_call,
+                            rejection_message=rejected_message,
+                            scope_id=self.tool_state_scope_id,
+                            tool_origin=get_function_tool_origin(func_tool),
+                        ),
+                    )
             approval_item = ToolApprovalItem(
                 agent=self.public_agent,
                 raw_item=raw_tool_call,
@@ -1718,6 +1800,7 @@ class _FunctionToolBatchExecutor:
             tool_input_guardrail_results=self.tool_input_guardrail_results,
         )
         if rejected_message is not None:
+            self.schema_bypassed_tool_runs.add(id(task_state.tool_run))
             return rejected_message
 
         await asyncio.gather(
@@ -1742,6 +1825,12 @@ class _FunctionToolBatchExecutor:
         task_state.invoke_task = invoke_task
         return await self._await_invoke_task(outer_task=outer_task, invoke_task=invoke_task)
 
+    def _should_run_pre_approval_tool_input_guardrails(self) -> bool:
+        tool_execution = self.config.tool_execution
+        if tool_execution is None:
+            return False
+        return tool_execution.pre_approval_tool_input_guardrails
+
     async def _invoke_tool_and_run_post_invoke(
         self,
         *,
@@ -1752,12 +1841,15 @@ class _FunctionToolBatchExecutor:
         tool_context: ToolContext[Any],
         agent_hooks: Any,
     ) -> Any:
+        bypass_output_schema = False
         try:
-            real_result = await invoke_function_tool(
+            invocation_result = await _invoke_function_tool_with_metadata(
                 function_tool=func_tool,
                 context=tool_context,
                 arguments=tool_call.arguments,
             )
+            real_result = invocation_result.output
+            bypass_output_schema = invocation_result.is_sdk_generated_error
         except asyncio.CancelledError as e:
             if outer_task in self.teardown_cancelled_tasks:
                 raise
@@ -1769,6 +1861,10 @@ class _FunctionToolBatchExecutor:
             )
             if result is None:
                 raise
+
+            bypass_output_schema = _consume_function_tool_default_failure(
+                tool_context
+            ) and not _uses_programmatic_output_schema(func_tool, tool_call)
 
             trace_error = get_trace_tool_error(
                 trace_include_sensitive_data=self.config.trace_include_sensitive_data,
@@ -1784,13 +1880,35 @@ class _FunctionToolBatchExecutor:
 
         task_state.in_post_invoke_phase = True
 
-        final_result = await _execute_tool_output_guardrails(
+        output_guardrail_result = await _execute_tool_output_guardrails(
             func_tool=func_tool,
             tool_context=tool_context,
             agent=self.public_agent,
             real_result=real_result,
             tool_output_guardrail_results=self.tool_output_guardrail_results,
         )
+        final_result = output_guardrail_result.output
+        bypass_output_schema = bypass_output_schema or (output_guardrail_result.is_rejection)
+        if bypass_output_schema:
+            self.schema_bypassed_tool_runs.add(id(task_state.tool_run))
+        raw_output_item = ItemHelpers.tool_call_output_item(
+            tool_call,
+            final_result,
+            output_json_schema=None if bypass_output_schema else func_tool.output_json_schema,
+            output_type_adapter=None if bypass_output_schema else func_tool._output_type_adapter,
+        )
+        extracted_custom_data = await maybe_extract_custom_data(
+            func_tool.custom_data_extractor,
+            FunctionToolCustomDataContext(
+                tool_context=tool_context,
+                tool=func_tool,
+                output=final_result,
+                raw_item=copy.deepcopy(raw_output_item),
+            ),
+        )
+        custom_data = merge_custom_data(tool_context._custom_data, extracted_custom_data)
+        if custom_data:
+            self.custom_data_by_tool_run[id(task_state.tool_run)] = custom_data
 
         await asyncio.gather(
             self.hooks.on_tool_end(tool_context, self.public_agent, func_tool, final_result),
@@ -1890,14 +2008,29 @@ class _FunctionToolBatchExecutor:
                 continue
 
             nested_run_result, nested_interruptions = self._resolve_nested_tool_run_result(tool_run)
+            bypass_output_schema = id(tool_run) in self.schema_bypassed_tool_runs
 
             run_item: RunItem | None
             if not nested_interruptions:
                 run_item = ToolCallOutputItem(
                     output=result,
-                    raw_item=ItemHelpers.tool_call_output_item(tool_run.tool_call, result),
+                    raw_item=ItemHelpers.tool_call_output_item(
+                        tool_run.tool_call,
+                        result,
+                        output_json_schema=(
+                            None
+                            if bypass_output_schema
+                            else tool_run.function_tool.output_json_schema
+                        ),
+                        output_type_adapter=(
+                            None
+                            if bypass_output_schema
+                            else tool_run.function_tool._output_type_adapter
+                        ),
+                    ),
                     agent=self.public_agent,
                     tool_origin=get_function_tool_origin(tool_run.function_tool),
+                    custom_data=self.custom_data_by_tool_run.get(id(tool_run)),
                 )
             else:
                 # Skip tool output until nested interruptions are resolved.
@@ -2321,10 +2454,10 @@ async def _execute_tool_output_guardrails(
     agent: Agent[Any],
     real_result: Any,
     tool_output_guardrail_results: list[ToolOutputGuardrailResult],
-) -> Any:
+) -> _ToolOutputGuardrailExecutionResult:
     """Execute output guardrails for a tool call and return the final result."""
     if not func_tool.tool_output_guardrails:
-        return real_result
+        return _ToolOutputGuardrailExecutionResult(real_result)
 
     final_result = real_result
     for output_guardrail in func_tool.tool_output_guardrails:
@@ -2346,10 +2479,12 @@ async def _execute_tool_output_guardrails(
         if gr_out.behavior["type"] == "raise_exception":
             raise ToolOutputGuardrailTripwireTriggered(guardrail=output_guardrail, output=gr_out)
         elif gr_out.behavior["type"] == "reject_content":
-            final_result = gr_out.behavior["message"]
-            break
+            return _ToolOutputGuardrailExecutionResult(
+                gr_out.behavior["message"],
+                is_rejection=True,
+            )
 
-    return final_result
+    return _ToolOutputGuardrailExecutionResult(final_result)
 
 
 def _normalize_exit_code(value: Any) -> int | None:

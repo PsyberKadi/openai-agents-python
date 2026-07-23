@@ -6,6 +6,7 @@ functions and approval plumbing live in tool_execution.py.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import inspect
 import json
@@ -20,13 +21,16 @@ from openai.types.responses.response_input_param import ComputerCallOutput
 from .._tool_identity import get_mapping_or_attr, get_tool_trace_name_for_tool
 from ..agent import Agent
 from ..exceptions import ModelBehaviorError
-from ..items import RunItem, ToolCallOutputItem
+from ..items import ItemHelpers, RunItem, ToolCallOutputItem
 from ..logger import logger
 from ..run_config import RunConfig
 from ..run_context import RunContextWrapper
 from ..tool import (
     ApplyPatchTool,
+    ApplyPatchToolCustomDataContext,
+    ComputerToolCustomDataContext,
     CustomTool,
+    CustomToolCustomDataContext,
     LocalShellCommandRequest,
     ShellCommandRequest,
     ShellResult,
@@ -36,6 +40,7 @@ from ..tool_context import ToolContext
 from ..tracing import SpanError
 from ..util import _coro
 from ..util._approvals import evaluate_needs_approval_setting
+from ..util._custom_data import maybe_extract_custom_data
 from .items import apply_patch_rejection_item, shell_rejection_item
 from .tool_execution import (
     coerce_apply_patch_operations,
@@ -43,6 +48,7 @@ from .tool_execution import (
     extract_apply_patch_call_id,
     format_shell_error,
     get_trace_tool_error,
+    log_tool_action_error,
     normalize_apply_patch_result,
     normalize_max_output_length,
     normalize_shell_output,
@@ -147,8 +153,29 @@ class ComputerAction:
                             },
                         )
                     )
-                logger.error("Failed to execute computer action: %s", exc, exc_info=True)
+                log_tool_action_error("Failed to execute computer action", exc)
                 raise
+
+            image_url = f"data:image/png;base64,{output}" if output else ""
+            raw_item = ComputerCallOutput(
+                call_id=action.tool_call.call_id,
+                output={
+                    "type": "computer_screenshot",
+                    "image_url": image_url,
+                },
+                type="computer_call_output",
+                acknowledged_safety_checks=acknowledged_safety_checks,
+            )
+            custom_data = await maybe_extract_custom_data(
+                action.computer_tool.custom_data_extractor,
+                ComputerToolCustomDataContext(
+                    run_context=context_wrapper,
+                    tool=action.computer_tool,
+                    tool_call=action.tool_call,
+                    output=image_url,
+                    raw_item=copy.deepcopy(raw_item),
+                ),
+            )
 
             await asyncio.gather(
                 hooks.on_tool_end(context_wrapper, agent, action.computer_tool, output),
@@ -159,22 +186,14 @@ class ComputerAction:
                 ),
             )
 
-            image_url = f"data:image/png;base64,{output}" if output else ""
             if span and config.trace_include_sensitive_data:
                 span.span_data.output = image_url
 
             return ToolCallOutputItem(
                 agent=agent,
                 output=image_url,
-                raw_item=ComputerCallOutput(
-                    call_id=action.tool_call.call_id,
-                    output={
-                        "type": "computer_screenshot",
-                        "image_url": image_url,
-                    },
-                    type="computer_call_output",
-                    acknowledged_safety_checks=acknowledged_safety_checks,
-                ),
+                raw_item=raw_item,
+                custom_data=custom_data,
             )
 
         return await with_tool_function_span(
@@ -460,6 +479,7 @@ class ShellAction:
                     return shell_rejection_item(
                         agent,
                         shell_call.call_id,
+                        tool_call=call.tool_call,
                         rejection_message=rejection_message,
                     )
 
@@ -538,7 +558,7 @@ class ShellAction:
                 if requested_max_output_length is not None:
                     max_output_length = requested_max_output_length
                     output_text = output_text[:max_output_length]
-                logger.error("Shell executor failed: %s", exc, exc_info=True)
+                log_tool_action_error("Shell executor failed", exc)
 
             await asyncio.gather(
                 hooks.on_tool_end(context_wrapper, agent, call.shell_tool, output_text),
@@ -570,6 +590,7 @@ class ShellAction:
                 "output": structured_output,
                 "status": status,
             }
+            ItemHelpers.copy_tool_call_caller(call.tool_call, raw_item)
             if max_output_length is not None:
                 raw_item["max_output_length"] = max_output_length
             if raw_entries:
@@ -650,7 +671,16 @@ class CustomToolAction:
                         tool_name=custom_tool.name,
                         call_id=call_id,
                     )
-                    return cls._tool_output_item(agent, call_id, rejection_message)
+                    return cls._tool_output_item(
+                        agent,
+                        call_id,
+                        rejection_message,
+                        raw_item=cls._raw_tool_output_item(
+                            call_id,
+                            rejection_message,
+                            tool_call=call.tool_call,
+                        ),
+                    )
 
                 if approval_status is not True:
                     return approval_item
@@ -684,7 +714,23 @@ class CustomToolAction:
                             },
                         )
                     )
-                logger.error("Custom tool failed: %s", exc, exc_info=True)
+                log_tool_action_error("Custom tool failed", exc)
+
+            raw_item = cls._raw_tool_output_item(
+                call_id,
+                output_text,
+                tool_call=call.tool_call,
+            )
+            custom_data = await maybe_extract_custom_data(
+                custom_tool.custom_data_extractor,
+                CustomToolCustomDataContext(
+                    tool_context=tool_context,
+                    tool=custom_tool,
+                    input=tool_input,
+                    output=output_text,
+                    raw_item=copy.deepcopy(raw_item),
+                ),
+            )
 
             await asyncio.gather(
                 hooks.on_tool_end(tool_context, agent, custom_tool, output_text),
@@ -697,8 +743,13 @@ class CustomToolAction:
 
             if span and config.trace_include_sensitive_data:
                 span.span_data.output = output_text
-
-            return cls._tool_output_item(agent, call_id, output_text)
+            return cls._tool_output_item(
+                agent,
+                call_id,
+                output_text,
+                raw_item=raw_item,
+                custom_data=custom_data,
+            )
 
         return await with_tool_function_span(
             config=config,
@@ -711,18 +762,36 @@ class CustomToolAction:
         return output if isinstance(output, str) else str(output)
 
     @staticmethod
-    def _tool_output_item(agent: Agent[Any], call_id: str, output: str) -> ToolCallOutputItem:
+    def _raw_tool_output_item(
+        call_id: str,
+        output: str,
+        *,
+        tool_call: Any | None = None,
+    ) -> dict[str, Any]:
+        raw_item = {
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "output": output,
+        }
+        if tool_call is not None:
+            ItemHelpers.copy_tool_call_caller(tool_call, raw_item)
+        return raw_item
+
+    @classmethod
+    def _tool_output_item(
+        cls,
+        agent: Agent[Any],
+        call_id: str,
+        output: str,
+        *,
+        raw_item: dict[str, Any] | None = None,
+        custom_data: dict[str, Any] | None = None,
+    ) -> ToolCallOutputItem:
         return ToolCallOutputItem(
             agent=agent,
             output=output,
-            raw_item=cast(
-                Any,
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": call_id,
-                    "output": output,
-                },
-            ),
+            raw_item=cast(Any, raw_item or cls._raw_tool_output_item(call_id, output)),
+            custom_data=custom_data,
         )
 
 
@@ -790,6 +859,7 @@ class ApplyPatchAction:
                     return apply_patch_rejection_item(
                         agent,
                         call_id,
+                        tool_call=call.tool_call,
                         output_type="apply_patch_call_output",
                         rejection_message=rejection_message,
                     )
@@ -851,7 +921,28 @@ class ApplyPatchAction:
                             },
                         )
                     )
-                logger.error("Apply patch editor failed: %s", exc, exc_info=True)
+                log_tool_action_error("Apply patch editor failed", exc)
+
+            raw_item: dict[str, Any] = {
+                "type": "apply_patch_call_output",
+                "call_id": call_id,
+                "status": status,
+            }
+            ItemHelpers.copy_tool_call_caller(call.tool_call, raw_item)
+            if output_text:
+                raw_item["output"] = output_text
+
+            custom_data = await maybe_extract_custom_data(
+                apply_patch_tool.custom_data_extractor,
+                ApplyPatchToolCustomDataContext(
+                    run_context=context_wrapper,
+                    tool=apply_patch_tool,
+                    operations=operations,
+                    output=output_text,
+                    status=status,
+                    raw_item=copy.deepcopy(raw_item),
+                ),
+            )
 
             await asyncio.gather(
                 hooks.on_tool_end(context_wrapper, agent, apply_patch_tool, output_text),
@@ -862,14 +953,6 @@ class ApplyPatchAction:
                 ),
             )
 
-            raw_item: dict[str, Any] = {
-                "type": "apply_patch_call_output",
-                "call_id": call_id,
-                "status": status,
-            }
-            if output_text:
-                raw_item["output"] = output_text
-
             if span and config.trace_include_sensitive_data:
                 span.span_data.output = output_text
 
@@ -877,6 +960,7 @@ class ApplyPatchAction:
                 agent=agent,
                 output=output_text,
                 raw_item=raw_item,
+                custom_data=custom_data,
             )
 
         return await with_tool_function_span(

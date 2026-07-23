@@ -63,13 +63,14 @@ class CallModelData(Generic[TContext]):
 
 CallModelInputFilter = Callable[[CallModelData[Any]], MaybeAwaitable[ModelInputData]]
 ReasoningItemIdPolicy = Literal["preserve", "omit"]
+ToolNotFoundBehavior = Literal["raise_error", "return_error_to_model"]
 
 
 @dataclass
 class ToolErrorFormatterArgs(Generic[TContext]):
     """Data passed to ``RunConfig.tool_error_formatter`` callbacks."""
 
-    kind: Literal["approval_rejected"]
+    kind: Literal["approval_rejected", "tool_not_found"]
     """The category of tool error being formatted."""
 
     tool_type: Literal["function", "computer", "shell", "apply_patch", "custom"]
@@ -102,11 +103,19 @@ class ToolExecutionConfig:
     emitted in a turn. This does not change provider-side `parallel_tool_calls` behavior.
     """
 
+    pre_approval_tool_input_guardrails: bool = False
+    """Run function tool input guardrails before emitting a pending approval interruption.
+
+    The same guardrails still run again immediately before tool execution after approval.
+    """
+
     def __post_init__(self) -> None:
         if self.max_function_tool_concurrency is not None and (
             self.max_function_tool_concurrency < 1
         ):
             raise ValueError("tool_execution.max_function_tool_concurrency must be at least 1")
+        if not isinstance(self.pre_approval_tool_input_guardrails, bool):
+            raise ValueError("tool_execution.pre_approval_tool_input_guardrails must be a bool")
 
 
 @dataclass
@@ -225,9 +234,10 @@ class RunConfig:
     """
 
     nest_handoff_history: bool = False
-    """Opt-in beta: wrap prior run history in a single assistant message before handing off when no
-    custom input filter is set. This is disabled by default while we stabilize nested handoffs; set
-    to True to enable the collapsed transcript behavior. Server-managed conversations
+    """Opt-in beta: compact prior run history into ordered assistant summary segments while
+    preserving lossless message items in their original positions. This is disabled by default
+    while we stabilize nested handoffs; set to True to enable the compacted transcript behavior.
+    Server-managed conversations
     (`conversation_id`, `previous_response_id`, or `auto_previous_response_id`) automatically
     disable this behavior with a warning.
     """
@@ -235,7 +245,8 @@ class RunConfig:
     handoff_history_mapper: HandoffHistoryMapper | None = None
     """Optional function that receives the normalized transcript (history + handoff items) and
     returns the input history that should be passed to the next agent. When left as `None`, the
-    runner collapses the transcript into a single assistant message. This function only runs when
+    runner uses ordered summary segments around lossless message items. When supplied, the
+    function's return value is used as the exact input history. This function only runs when
     `nest_handoff_history` is True.
     """
 
@@ -320,6 +331,14 @@ class RunConfig:
     tool_execution: ToolExecutionConfig | None = None
     """Optional SDK-side execution settings for local tool calls."""
 
+    tool_not_found_behavior: ToolNotFoundBehavior = "raise_error"
+    """Controls unresolved function tool calls emitted by the model.
+
+    - ``"raise_error"`` preserves the default behavior and raises ``ModelBehaviorError``.
+    - ``"return_error_to_model"`` returns a model-visible ``function_call_output`` error and lets
+      the run continue.
+    """
+
 
 class RunOptions(TypedDict, Generic[TContext]):
     """Arguments for ``AgentRunner`` methods."""
@@ -349,7 +368,7 @@ class RunOptions(TypedDict, Generic[TContext]):
     """The session for the run."""
 
     error_handlers: NotRequired[RunErrorHandlers[TContext] | None]
-    """Error handlers keyed by error kind. Currently supports max_turns."""
+    """Error handlers keyed by error kind."""
 
 
 __all__ = [

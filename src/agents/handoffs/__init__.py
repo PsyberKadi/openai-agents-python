@@ -80,7 +80,11 @@ class HandoffInputData:
         ```
         """
 
-        return dataclasses_replace(self, **kwargs)
+        cloned = dataclasses_replace(self, **kwargs)
+        owned_items = getattr(self, "_nested_history_owned_items", ())
+        if owned_items:
+            object.__setattr__(cloned, "_nested_history_owned_items", owned_items)
+        return cloned
 
 
 HandoffInputFilter: TypeAlias = Callable[[HandoffInputData], MaybeAwaitable[HandoffInputData]]
@@ -170,7 +174,10 @@ class Handoff(Generic[TContext, TAgent]):
 
     @classmethod
     def default_tool_name(cls, agent: AgentBase[Any]) -> str:
-        return _transforms.transform_string_function_style(f"transfer_to_{agent.name}")
+        return _transforms.transform_string_function_style(
+            f"transfer_to_{agent.name}",
+            warn_on_whitespace=False,
+        )
 
     @classmethod
     def default_tool_description(cls, agent: AgentBase[Any]) -> str:
@@ -289,6 +296,7 @@ def handoff(
                 json_str=input_json,
                 type_adapter=type_adapter,
                 partial=False,
+                strict=True,
             )
             input_func = cast(OnHandoffWithInput[THandoffInput], on_handoff)
             result = input_func(ctx, validated_input)

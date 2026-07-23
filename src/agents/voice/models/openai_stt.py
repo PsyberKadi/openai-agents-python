@@ -14,6 +14,7 @@ from ... import _debug
 from ...exceptions import AgentsException
 from ...logger import logger
 from ...tracing import Span, SpanError, TranscriptionSpanData, transcription_span
+from ...util._error_tracing import get_trace_error
 from ..exceptions import STTWebsocketConnectionError
 from ..imports import np, npt, websockets
 from ..input import AudioInput, StreamedAudioInput
@@ -40,13 +41,15 @@ class WebsocketDoneSentinel:
 
 
 def _audio_to_base64(audio_data: list[npt.NDArray[np.int16 | np.float32]]) -> str:
-    concatenated_audio = np.concatenate(audio_data)
-    if concatenated_audio.dtype == np.float32:
-        # convert to int16
-        concatenated_audio = np.clip(concatenated_audio, -1.0, 1.0)
-        concatenated_audio = (concatenated_audio * 32767).astype(np.int16)
-    audio_bytes = concatenated_audio.tobytes()
-    return base64.b64encode(audio_bytes).decode("utf-8")
+    return _audio_buffer_to_base64(np.concatenate(audio_data))
+
+
+def _audio_buffer_to_base64(buffer: npt.NDArray[np.int16 | np.float32]) -> str:
+    if buffer.dtype == np.float32:
+        # Convert to int16.
+        buffer = np.clip(buffer, -1.0, 1.0)
+        buffer = (buffer * 32767).astype(np.int16)
+    return base64.b64encode(buffer.tobytes()).decode("utf-8")
 
 
 async def _wait_for_event(
@@ -210,7 +213,7 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
             if _debug.DONT_LOG_MODEL_DATA:
                 logger.debug("Session updated")
             else:
-                logger.debug(f"Session updated: {event}")
+                logger.debug("Session updated: %s", event)
         except TimeoutError as e:
             wrapped_err = STTWebsocketConnectionError(
                 "Timeout waiting for transcription_session.updated event"
@@ -266,7 +269,7 @@ class OpenAISTTTranscriptionSession(StreamedTranscriptionSession):
                     json.dumps(
                         {
                             "type": "input_audio_buffer.append",
-                            "audio": base64.b64encode(buffer.tobytes()).decode("utf-8"),
+                            "audio": _audio_buffer_to_base64(buffer),
                         }
                     )
                 )
@@ -433,7 +436,15 @@ class OpenAISTTModel(STTModel):
                 return response.text
             except Exception as e:
                 span.span_data.output = ""
-                span.set_error(SpanError(message=str(e), data={}))
+                span.set_error(
+                    SpanError(
+                        message=get_trace_error(
+                            trace_include_sensitive_data=trace_include_sensitive_data,
+                            error_message=str(e),
+                        ),
+                        data={},
+                    )
+                )
                 raise e
 
     async def create_session(

@@ -93,7 +93,7 @@ crm_tools = tool_namespace(
 
 agent = Agent(
     name="Operations assistant",
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
     instructions="Load the crm namespace before using CRM tools.",
     tools=[*crm_tools, ToolSearchTool()],
 )
@@ -134,7 +134,7 @@ csv_skill: ShellToolSkillReference = {
 
 agent = Agent(
     name="Container shell agent",
-    model="gpt-5.5",
+    model="gpt-5.6-sol",
     instructions="Use the mounted skill when helpful.",
     tools=[
         ShellTool(
@@ -243,7 +243,7 @@ agent = Agent(
 
 ## Function tools
 
-You can use any Python function as a tool. The Agents SDK will setup the tool automatically:
+You can use any Python function as a tool. The Agents SDK will set up the tool automatically:
 
 -   The name of the tool will be the name of the Python function (or you can provide a name)
 -   Tool description will be taken from the docstring of the function (or you can provide a description)
@@ -462,7 +462,7 @@ You can set per-call timeouts for async function tools with `@function_tool(time
 
 ```python
 import asyncio
-from agents import Agent, Runner, function_tool
+from agents import Agent, function_tool
 
 
 @function_tool(timeout=2.0)
@@ -545,8 +545,9 @@ If you are manually creating a `FunctionTool` object, then you must handle error
 In some workflows, you may want a central agent to orchestrate a network of specialized agents, instead of handing off control. You can do this by modeling agents as tools.
 
 ```python
-from agents import Agent, Runner
 import asyncio
+
+from agents import Agent, Runner
 
 spanish_agent = Agent(
     name="Spanish agent",
@@ -561,7 +562,7 @@ french_agent = Agent(
 orchestrator_agent = Agent(
     name="orchestrator_agent",
     instructions=(
-        "You are a translation agent. You use the tools given to you to translate."
+        "You are a translation agent. You use the tools given to you to translate. "
         "If asked for multiple translations, you call the relevant tools."
     ),
     tools=[
@@ -579,11 +580,17 @@ orchestrator_agent = Agent(
 async def main():
     result = await Runner.run(orchestrator_agent, input="Say 'Hello, how are you?' in Spanish.")
     print(result.final_output)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
 ### Customizing tool-agents
 
-The `agent.as_tool` function is a convenience method to make it easy to turn an agent into a tool. It supports common runtime options such as `max_turns`, `run_config`, `hooks`, `previous_response_id`, `conversation_id`, `session`, and `needs_approval`. It also supports structured input with `parameters`, `input_builder`, and `include_input_schema`. For advanced orchestration (for example, conditional retries, fallback behavior, or chaining multiple agent calls), use `Runner.run` directly in your tool implementation:
+The `agent.as_tool` function is a convenience method to make it easy to turn an agent into a tool. It supports common runtime options such as `max_turns`, `run_config`, `hooks`, `previous_response_id`, `conversation_id`, `session`, and `needs_approval`. It also supports structured input with `parameters`, `input_builder`, and `include_input_schema`.
+
+The state options configure the nested agent run started by the tool call; the parent run's conversation state is not inherited automatically. To share client-managed history between the parent and nested runs, explicitly pass the same `session` to both. As with `Runner.run`, choose one state strategy for the nested run: a client-managed `session`, or server-managed continuation through `previous_response_id` or `conversation_id`.
 
 ```python
 @function_tool
@@ -663,10 +670,7 @@ json_tool = data_agent.as_tool(
 )
 ```
 
-Inside a custom extractor, the nested [`RunResult`][agents.result.RunResult] also exposes
-[`agent_tool_invocation`][agents.result.RunResultBase.agent_tool_invocation], which is useful when
-you need the outer tool name, call ID, or raw arguments while post-processing the nested result.
-See the [Results guide](results.md#agent-as-tool-metadata).
+Inside a custom extractor, the nested [`RunResult`][agents.result.RunResult] also exposes [`agent_tool_invocation`][agents.result.RunResultBase.agent_tool_invocation], which is useful when you need the outer tool name, call ID, or raw arguments while post-processing the nested result. See the [Results guide](results.md#agent-as-tool-metadata).
 
 ### Streaming nested agent runs
 
@@ -746,8 +750,8 @@ orchestrator = Agent(
 )
 
 async def main():
-    context = RunContextWrapper(LanguageContext(language_preference="french_spanish"))
-    result = await Runner.run(orchestrator, "How are you?", context=context.context)
+    context = LanguageContext(language_preference="french_spanish")
+    result = await Runner.run(orchestrator, "How are you?", context=context)
     print(result.final_output)
 
 asyncio.run(main())

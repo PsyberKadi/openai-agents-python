@@ -48,13 +48,8 @@ description: Run python examples in auto mode with logging, rerun helpers, and b
 
 ## Codex execution environment
 
-- When Codex invokes `start` or `rerun`, run the command outside the Codex sandbox by default
-  (`sandbox_permissions=require_escalated`). Many examples start nested sandboxes, browsers, npm
-  helpers, or cloud/local service processes; running from inside the Codex sandbox can produce
-  environment-only failures such as `sandbox-exec: sandbox_apply: Operation not permitted`,
-  Playwright cache permission errors, or npm cache permission errors.
-- Use sandboxed execution only when the user explicitly asks for it or when running a narrow dry-run
-  / log inspection command that does not execute examples.
+- When Codex invokes `start` or `rerun`, run the command outside the Codex sandbox by default (`sandbox_permissions=require_escalated`). Many examples start nested sandboxes, browsers, npm helpers, or cloud/local service processes; running from inside the Codex sandbox can produce environment-only failures such as `sandbox-exec: sandbox_apply: Operation not permitted`, Playwright cache permission errors, or npm cache permission errors.
+- Use sandboxed execution only when the user explicitly asks for it or when running a narrow dry-run / log inspection command that does not execute examples.
 
 ## Defaults (overridable via env)
 
@@ -76,6 +71,7 @@ description: Run python examples in auto mode with logging, rerun helpers, and b
 ## Notes
 
 - The runner delegates to `uv run --extra ... examples/run_examples.py`, which already writes per-example logs and supports `--collect`, `--rerun-file`, and `--print-auto-skip`.
+- `examples/sandbox/extensions/vercel_runner.py` is temporarily excluded from auto runs due to credential issues. Do not force-run it until the credential setup is fixed.
 - `start` uses `--write-rerun` so failures are captured automatically.
 - If `.tmp/examples-rerun.txt` exists and is non-empty, invoking the skill with no args runs `rerun` by default.
 

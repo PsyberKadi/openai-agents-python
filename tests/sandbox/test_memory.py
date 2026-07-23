@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from openai.types.responses import ResponseCustomToolCall
+from openai.types.responses import ResponseCustomToolCall, ResponseFunctionToolCall
 from openai.types.responses.response_output_message import ResponseOutputMessage
 from openai.types.responses.response_reasoning_item import ResponseReasoningItem
 
@@ -24,7 +24,12 @@ from agents import (
     TResponseInputItem,
 )
 from agents.exceptions import UserError
-from agents.items import CompactionItem, MessageOutputItem, TResponseOutputItem
+from agents.items import (
+    CompactionItem,
+    MessageOutputItem,
+    ToolApprovalItem,
+    TResponseOutputItem,
+)
 from agents.result import RunResultStreaming
 from agents.run import _sandbox_memory_input
 from agents.run_context import RunContextWrapper
@@ -258,6 +263,34 @@ def test_build_rollout_payload_filters_developer_and_noisy_items() -> None:
     assert payload["final_output"] == "done"
 
 
+def test_build_rollout_payload_serializes_model_interruptions_as_dicts() -> None:
+    agent = Agent(name="test")
+    raw = ResponseFunctionToolCall(
+        id="fc_1",
+        call_id="call_1",
+        name="get_weather",
+        arguments='{"city":"Paris"}',
+        type="function_call",
+    )
+    approval = ToolApprovalItem(agent=agent, raw_item=raw)
+
+    payload = build_rollout_payload(
+        input="hello",
+        new_items=[],
+        final_output=None,
+        interruptions=[approval],
+        terminal_metadata=RolloutTerminalMetadata(terminal_state="interrupted"),
+    )
+
+    interruption = payload["interruptions"][0]
+    assert isinstance(interruption, dict)
+    assert interruption == raw.model_dump(exclude_unset=True)
+    assert interruption["type"] == "function_call"
+    assert interruption["call_id"] == "call_1"
+    assert interruption["name"] == "get_weather"
+    assert interruption["arguments"] == '{"city":"Paris"}'
+
+
 def test_render_phase_one_prompt_truncates_large_rollout_contents() -> None:
     payload = {
         "input": [{"role": "user", "content": f"start{'a' * 700_000}middle{'z' * 700_000}end"}],
@@ -396,6 +429,28 @@ def test_render_memory_prompts_include_extra_prompt_section() -> None:
     assert "Focus on user preferences." in rollout_prompt
     assert "DEVELOPER-SPECIFIC EXTRA GUIDANCE" in consolidation_prompt
     assert "Focus on user preferences." in consolidation_prompt
+
+
+def test_render_memory_consolidation_prompt_lists_removed_rollouts() -> None:
+    selection = PhaseTwoInputSelection(
+        selected=[],
+        retained_rollout_ids=set(),
+        removed=[
+            PhaseTwoSelectionItem(
+                rollout_id="old-rollout",
+                updated_at="",
+                rollout_path="sessions/old-rollout.jsonl",
+                rollout_summary_file="memories/rollout_summaries/old.md",
+                terminal_state="completed",
+            )
+        ],
+    )
+
+    prompt = render_memory_consolidation_prompt(memory_root="memory", selection=selection)
+
+    assert "- removed from the last successful Phase 2 run: 1" in prompt
+    assert "rollout_id=old-rollout" in prompt
+    assert "updated_at=unknown" in prompt
 
 
 def test_updated_at_sort_key_places_unknown_timestamps_last() -> None:
@@ -610,6 +665,14 @@ def test_memory_capability_rejects_invalid_sessions_dir(
 def test_memory_capability_requires_read_or_generate() -> None:
     with pytest.raises(ValueError, match="Memory requires at least one of `read` or `generate`"):
         Memory(read=None, generate=None)
+
+
+@pytest.mark.asyncio
+async def test_memory_capability_instructions_requires_bound_session() -> None:
+    capability = Memory(generate=None)
+
+    with pytest.raises(ValueError, match="Memory capability is not bound to a SandboxSession"):
+        await capability.instructions(Manifest())
 
 
 def test_memory_generate_config_rejects_non_positive_recent_rollout_limit() -> None:

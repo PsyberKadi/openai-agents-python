@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agents import Agent, RunConfig, Runner, ToolExecutionConfig
+from agents import Agent, RunConfig, Runner, ToolExecutionConfig, ToolNotFoundBehavior
 from agents.model_settings import ModelSettings
 from agents.models.interface import Model, ModelProvider
 
@@ -58,8 +58,14 @@ async def test_run_config_model_name_override_takes_precedence() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_name", "reasoning_effort"),
+    [("gpt-5", "low"), ("gpt-5.6", "none")],
+)
 async def test_run_config_model_name_override_uses_model_specific_default_settings(
     monkeypatch,
+    model_name,
+    reasoning_effort,
 ) -> None:
     """
     When RunConfig sets a model name, implicit settings should match that model name rather
@@ -69,12 +75,12 @@ async def test_run_config_model_name_override_uses_model_specific_default_settin
     fake_model = FakeModel(initial_output=[get_text_message("override-name")])
     provider = DummyProvider(model_to_return=fake_model)
     agent = Agent(name="test")
-    run_config = RunConfig(model="gpt-5", model_provider=provider)
+    run_config = RunConfig(model=model_name, model_provider=provider)
     result = await Runner.run(agent, input="any", run_config=run_config)
     assert result.final_output == "override-name"
     assert fake_model.first_turn_args is not None
     model_settings = fake_model.first_turn_args["model_settings"]
-    assert model_settings.reasoning.effort == "low"
+    assert model_settings.reasoning.effort == reasoning_effort
     assert model_settings.verbosity == "low"
 
 
@@ -200,3 +206,16 @@ def test_tool_execution_config_is_public_from_agents_package() -> None:
 
     assert config.tool_execution is not None
     assert config.tool_execution.max_function_tool_concurrency == 2
+
+
+def test_tool_not_found_behavior_defaults_to_raise_error() -> None:
+    config = RunConfig()
+
+    assert config.tool_not_found_behavior == "raise_error"
+
+
+def test_tool_not_found_behavior_is_public_from_agents_package() -> None:
+    behavior: ToolNotFoundBehavior = "return_error_to_model"
+    config = RunConfig(tool_not_found_behavior=behavior)
+
+    assert config.tool_not_found_behavior == "return_error_to_model"

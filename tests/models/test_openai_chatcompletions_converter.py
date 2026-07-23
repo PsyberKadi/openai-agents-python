@@ -24,7 +24,7 @@ These tests exercise both conversion directions:
 from __future__ import annotations
 
 import logging
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import pytest
 from openai import omit
@@ -191,6 +191,37 @@ def test_items_to_messages_with_easy_input_message():
     assert out["content"] == "How are you?"
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "hello",
+        "",
+        [],
+        [{"type": "input_text", "text": "hello"}],
+    ],
+)
+@pytest.mark.parametrize(
+    "optional_keys",
+    [
+        {"type": "message"},
+        {"phase": "commentary"},
+        {"type": "message", "phase": "final_answer"},
+    ],
+)
+def test_easy_input_assistant_optional_keys_match_bare_shape(
+    content: Any,
+    optional_keys: dict[str, Any],
+):
+    """Optional message fields must not change easy-input conversion."""
+    untyped = cast(TResponseInputItem, {"role": "assistant", "content": content})
+    extended = cast(
+        TResponseInputItem,
+        {"role": "assistant", "content": content, **optional_keys},
+    )
+
+    assert Converter.items_to_messages([extended]) == Converter.items_to_messages([untyped])
+
+
 def test_items_to_messages_accepts_raw_chat_completions_user_content_parts():
     """
     Raw Chat Completions content parts should be accepted as aliases for the SDK's
@@ -290,6 +321,29 @@ def test_items_to_messages_with_output_message_and_function_call():
     assert tool_call["type"] == "function"
     assert tool_call["function"]["name"] == "math"
     assert tool_call["function"]["arguments"] == "{}"
+
+
+def test_items_to_messages_accepts_statusless_output_message():
+    """Output messages remain recognizable after replay normalization removes null status."""
+    statusless_message = cast(
+        TResponseInputItem,
+        {
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "hello",
+                    "annotations": [],
+                }
+            ],
+        },
+    )
+
+    assert Converter.items_to_messages([statusless_message]) == [
+        {"role": "assistant", "content": "hello"}
+    ]
 
 
 def test_convert_tool_choice_handles_standard_and_named_options() -> None:
@@ -532,6 +586,59 @@ def test_extract_all_content_handles_input_audio():
             "input_audio": {"data": "AAA=", "format": "wav"},
         }
     ]
+
+
+def test_extract_all_content_preserves_prompt_cache_breakpoints() -> None:
+    breakpoint = {"mode": "explicit"}
+    content: list[dict[str, Any]] = [
+        {
+            "type": "input_text",
+            "text": "one",
+            "prompt_cache_breakpoint": breakpoint,
+        },
+        {
+            "type": "input_image",
+            "image_url": "https://example.com/image.png",
+            "prompt_cache_breakpoint": breakpoint,
+        },
+        {
+            "type": "input_audio",
+            "input_audio": {"data": "AAA=", "format": "wav"},
+            "prompt_cache_breakpoint": breakpoint,
+        },
+        {
+            "type": "input_file",
+            "file_data": "data:text/plain;base64,SGVsbG8=",
+            "filename": "hello.txt",
+            "prompt_cache_breakpoint": breakpoint,
+        },
+    ]
+
+    parts = Converter.extract_all_content(content)
+
+    assert isinstance(parts, list)
+    assert [part["prompt_cache_breakpoint"] for part in parts] == [breakpoint] * 4
+
+
+def test_raw_chat_content_aliases_preserve_prompt_cache_breakpoints() -> None:
+    breakpoint = {"mode": "explicit"}
+
+    parts = Converter.extract_all_content(
+        cast(
+            list[dict[str, Any]],
+            [
+                {"type": "text", "text": "one", "prompt_cache_breakpoint": breakpoint},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.png"},
+                    "prompt_cache_breakpoint": breakpoint,
+                },
+            ],
+        )
+    )
+
+    assert isinstance(parts, list)
+    assert [part["prompt_cache_breakpoint"] for part in parts] == [breakpoint, breakpoint]
 
 
 def test_extract_all_content_rejects_invalid_input_audio():

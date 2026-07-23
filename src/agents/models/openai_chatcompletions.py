@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import time
 from collections.abc import AsyncIterator
@@ -33,6 +35,7 @@ from ..usage import Usage
 from ..util._json import _to_dump_compatible
 from ._openai_retry import get_openai_retry_advice
 from ._retry_runtime import should_disable_provider_managed_retries
+from ._trace import model_config_for_trace
 from .chatcmpl_converter import Converter
 from .chatcmpl_helpers import HEADERS, HEADERS_OVERRIDE, ChatCmplHelpers
 from .chatcmpl_stream_handler import ChatCmplStreamHandler
@@ -56,13 +59,16 @@ class OpenAIChatCompletionsModel(Model):
         openai_client: AsyncOpenAI,
         should_replay_reasoning_content: ShouldReplayReasoningContent | None = None,
         strict_feature_validation: bool = False,
+        buffer_streamed_tool_calls: bool = False,
     ) -> None:
         self.model = model
         self._client = openai_client
         self.should_replay_reasoning_content = should_replay_reasoning_content
         self._strict_feature_validation = strict_feature_validation
+        self._buffer_streamed_tool_calls = buffer_streamed_tool_calls
         self._has_warned_unsupported_prompt = False
         self._has_warned_unsupported_conversation_state = False
+        self._has_warned_unsupported_reasoning_settings = False
 
     def _non_null_or_omit(self, value: Any) -> Any:
         return value if value is not None else omit
@@ -89,8 +95,61 @@ class OpenAIChatCompletionsModel(Model):
             )
             self._has_warned_unsupported_prompt = True
 
+    def _handle_unsupported_reasoning_settings(self, model_settings: ModelSettings) -> None:
+        reasoning = model_settings.reasoning
+        if reasoning is None:
+            return
+
+        unsupported = [
+            name for name in ("mode", "context") if getattr(reasoning, name, None) is not None
+        ]
+        if not unsupported:
+            return
+
+        unsupported_params = ", ".join(f"reasoning.{name}" for name in unsupported)
+        message = (
+            f"OpenAIChatCompletionsModel does not support {unsupported_params}. "
+            "These reasoning settings require the Responses API; Chat Completions only "
+            "uses reasoning.effort."
+        )
+        if self._strict_feature_validation:
+            raise UserError(message)
+
+        if not self._has_warned_unsupported_reasoning_settings:
+            logger.warning(
+                "%s Ignoring unsupported reasoning settings; enable strict feature validation "
+                "to raise an error instead.",
+                message,
+            )
+            self._has_warned_unsupported_reasoning_settings = True
+
     def get_retry_advice(self, request: ModelRetryAdviceRequest) -> ModelRetryAdvice | None:
         return get_openai_retry_advice(request)
+
+    async def _maybe_aclose_async_iterator(self, iterator: Any) -> None:
+        aclose = getattr(iterator, "aclose", None)
+        if callable(aclose):
+            await aclose()
+            return
+
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close_result = close()
+            if inspect.isawaitable(close_result):
+                await close_result
+
+    def _schedule_async_iterator_close(self, iterator: Any) -> None:
+        task = asyncio.create_task(self._maybe_aclose_async_iterator(iterator))
+        task.add_done_callback(self._consume_background_cleanup_task_result)
+
+    @staticmethod
+    def _consume_background_cleanup_task_result(task: asyncio.Task[Any]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("Background stream cleanup failed after cancellation: %s", exc)
 
     def _validate_official_openai_input_content_types(
         self, request_input: str | list[TResponseInputItem]
@@ -147,7 +206,7 @@ class OpenAIChatCompletionsModel(Model):
 
         with generation_span(
             model=str(self.model),
-            model_config=model_settings.to_json_dict() | {"base_url": str(self._client.base_url)},
+            model_config=model_config_for_trace(model_settings, base_url=self._client.base_url),
             disabled=tracing.is_disabled(),
         ) as span_generation:
             response = await self._fetch_response(
@@ -187,7 +246,7 @@ class OpenAIChatCompletionsModel(Model):
                     )
                 else:
                     finish_reason = first_choice.finish_reason if first_choice else "-"
-                    logger.debug(f"LLM resp had no message. finish_reason: {finish_reason}")
+                    logger.debug("LLM resp had no message. finish_reason: %s", finish_reason)
 
             usage = (
                 Usage(
@@ -281,7 +340,7 @@ class OpenAIChatCompletionsModel(Model):
 
         with generation_span(
             model=str(self.model),
-            model_config=model_settings.to_json_dict() | {"base_url": str(self._client.base_url)},
+            model_config=model_config_for_trace(model_settings, base_url=self._client.base_url),
             disabled=tracing.is_disabled(),
         ) as span_generation:
             response, stream = await self._fetch_response(
@@ -298,16 +357,41 @@ class OpenAIChatCompletionsModel(Model):
             )
 
             final_response: Response | None = None
-            async for chunk in ChatCmplStreamHandler.handle_stream(
-                response,
-                stream,
-                model=self.model,
-                strict_feature_validation=self._strict_feature_validation,
-            ):
-                yield chunk
+            stream_for_handler: AsyncIterator[ChatCompletionChunk]
+            if self._buffer_streamed_tool_calls:
+                stream_for_handler = ChatCmplStreamHandler.buffer_tool_call_stream(stream)
+            else:
+                stream_for_handler = stream
 
-                if chunk.type == "response.completed":
-                    final_response = chunk.response
+            close_stream_in_background = False
+            yielded_terminal_event = False
+            try:
+                async for chunk in ChatCmplStreamHandler.handle_stream(
+                    response,
+                    cast(AsyncStream[ChatCompletionChunk], stream_for_handler),
+                    model=self.model,
+                    strict_feature_validation=self._strict_feature_validation,
+                ):
+                    if chunk.type == "response.completed":
+                        final_response = chunk.response
+                        yielded_terminal_event = True
+
+                    yield chunk
+            except asyncio.CancelledError:
+                close_stream_in_background = True
+                self._schedule_async_iterator_close(stream)
+                raise
+            finally:
+                if not close_stream_in_background:
+                    try:
+                        await self._maybe_aclose_async_iterator(stream)
+                    except Exception as exc:
+                        if yielded_terminal_event:
+                            logger.debug(
+                                "Ignoring stream cleanup error after terminal event: %s", exc
+                            )
+                        else:
+                            raise
 
             if tracing.include_data() and final_response:
                 span_generation.span_data.output = [final_response.model_dump()]
@@ -321,7 +405,7 @@ class OpenAIChatCompletionsModel(Model):
                     "input_tokens_details": (
                         final_response.usage.input_tokens_details.model_dump()
                         if final_response.usage.input_tokens_details
-                        else {"cached_tokens": 0}
+                        else {"cached_tokens": 0, "cache_write_tokens": 0}
                     ),
                     "output_tokens_details": (
                         final_response.usage.output_tokens_details.model_dump()
@@ -406,6 +490,7 @@ class OpenAIChatCompletionsModel(Model):
         prompt: ResponsePromptParam | None = None,
     ) -> ChatCompletion | tuple[Response, AsyncStream[ChatCompletionChunk]]:
         self._handle_unsupported_prompt(prompt)
+        self._handle_unsupported_reasoning_settings(model_settings)
         self._validate_official_openai_input_content_types(input)
         converted_messages = Converter.items_to_messages(
             input,
@@ -459,11 +544,12 @@ class OpenAIChatCompletionsModel(Model):
                 ensure_ascii=False,
             )
             logger.debug(
-                f"{messages_json}\n"
-                f"Tools:\n{tools_json}\n"
-                f"Stream: {stream}\n"
-                f"Tool choice: {tool_choice}\n"
-                f"Response format: {response_format}\n"
+                "%s\nTools:\n%s\nStream: %s\nTool choice: %s\nResponse format: %s\n",
+                messages_json,
+                tools_json,
+                stream,
+                tool_choice,
+                response_format,
             )
 
         reasoning_effort = model_settings.reasoning.effort if model_settings.reasoning else None
@@ -494,13 +580,25 @@ class OpenAIChatCompletionsModel(Model):
             "verbosity": self._non_null_or_omit(model_settings.verbosity),
             "top_logprobs": self._non_null_or_omit(model_settings.top_logprobs),
             "prompt_cache_retention": self._non_null_or_omit(model_settings.prompt_cache_retention),
+            "prompt_cache_options": self._non_null_or_omit(model_settings.prompt_cache_options),
             "extra_headers": self._merge_headers(model_settings),
             "extra_query": model_settings.extra_query,
             "extra_body": model_settings.extra_body,
             "metadata": self._non_null_or_omit(model_settings.metadata),
         }
+        # The Chat Completions API requires logprobs=True whenever top_logprobs is set.
+        # Skip the key when the caller already supplies logprobs via extra_args, so that
+        # extra_args={"logprobs": ...} keeps passing through and setting both top_logprobs
+        # and extra_args["logprobs"] (a pre-existing workaround) does not collide with the
+        # duplicate-key check below.
+        if model_settings.top_logprobs is not None and "logprobs" not in (
+            model_settings.extra_args or {}
+        ):
+            create_kwargs["logprobs"] = True
         duplicate_extra_arg_keys = sorted(
-            set(create_kwargs).intersection(model_settings.extra_args or {})
+            key
+            for key in model_settings.extra_args or {}
+            if key in create_kwargs and not isinstance(create_kwargs[key], Omit)
         )
         if duplicate_extra_arg_keys:
             if len(duplicate_extra_arg_keys) == 1:

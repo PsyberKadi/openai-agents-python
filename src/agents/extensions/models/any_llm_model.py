@@ -34,6 +34,7 @@ from ...models._response_terminal import (
     response_terminal_failure_error,
 )
 from ...models._retry_runtime import should_disable_provider_managed_retries
+from ...models._trace import model_config_for_trace
 from ...models.chatcmpl_converter import Converter
 from ...models.chatcmpl_helpers import HEADERS, HEADERS_OVERRIDE, ChatCmplHelpers
 from ...models.chatcmpl_stream_handler import ChatCmplStreamHandler
@@ -467,12 +468,11 @@ class AnyLLMModel(Model):
     ) -> ModelResponse:
         with generation_span(
             model=str(self.model),
-            model_config=model_settings.to_json_dict()
-            | {
-                "base_url": str(self.base_url or ""),
-                "provider": self._provider_name,
-                "model_impl": "any-llm",
-            },
+            model_config=model_config_for_trace(
+                model_settings,
+                base_url=self.base_url or "",
+                extra_config={"provider": self._provider_name, "model_impl": "any-llm"},
+            ),
             disabled=tracing.is_disabled(),
         ) as span_generation:
             response = await self._fetch_chat_response(
@@ -504,7 +504,7 @@ class AnyLLMModel(Model):
                     )
                 else:
                     finish_reason = first_choice.finish_reason if first_choice else "-"
-                    logger.debug(f"LLM resp had no message. finish_reason: {finish_reason}")
+                    logger.debug("LLM resp had no message. finish_reason: %s", finish_reason)
 
             usage = (
                 Usage(
@@ -570,12 +570,11 @@ class AnyLLMModel(Model):
     ) -> AsyncIterator[TResponseStreamEvent]:
         with generation_span(
             model=str(self.model),
-            model_config=model_settings.to_json_dict()
-            | {
-                "base_url": str(self.base_url or ""),
-                "provider": self._provider_name,
-                "model_impl": "any-llm",
-            },
+            model_config=model_config_for_trace(
+                model_settings,
+                base_url=self.base_url or "",
+                extra_config={"provider": self._provider_name, "model_impl": "any-llm"},
+            ),
             disabled=tracing.is_disabled(),
         ) as span_generation:
             response, stream = await self._fetch_chat_response(
@@ -616,7 +615,7 @@ class AnyLLMModel(Model):
                     "input_tokens_details": (
                         final_response.usage.input_tokens_details.model_dump()
                         if final_response.usage.input_tokens_details
-                        else {"cached_tokens": 0}
+                        else {"cached_tokens": 0, "cache_write_tokens": 0}
                     ),
                     "output_tokens_details": (
                         final_response.usage.output_tokens_details.model_dump()

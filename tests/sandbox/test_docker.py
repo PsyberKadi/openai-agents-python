@@ -46,7 +46,9 @@ from agents.sandbox.errors import (
     InvalidManifestPathError,
     MountConfigError,
     PtySessionNotFoundError,
+    WorkspaceArchiveReadError,
     WorkspaceArchiveWriteError,
+    WorkspaceReadNotFoundError,
 )
 from agents.sandbox.files import EntryKind, FileEntry
 from agents.sandbox.manifest import Manifest
@@ -298,6 +300,7 @@ class _HostBackedDockerSession(DockerSandboxSession):
         manifest: Manifest,
         event_log: list[tuple[str, str]] | None = None,
         archive_error: Exception | None = None,
+        read_probe_exit_code: int | None = None,
     ) -> None:
         container = _FakeDockerContainer(host_root, archive_error=archive_error)
         state = DockerSandboxSessionState(
@@ -314,6 +317,19 @@ class _HostBackedDockerSession(DockerSandboxSession):
         self._host_root = host_root
         self._fake_container = container
         self._event_log = event_log if event_log is not None else []
+        self._read_probe_exit_code = read_probe_exit_code
+        self._read_probe_users: list[str | None] = []
+
+    async def _exec_internal_for_user(
+        self,
+        *command: str | Path,
+        timeout: float | None = None,
+        user: str | None = None,
+    ) -> ExecResult:
+        cmd = [str(part) for part in command]
+        if cmd[:2] == ["sh", "-c"] and "READ_PATH_PROBE_V3" in cmd[2]:
+            self._read_probe_users.append(user)
+        return await self._exec_internal(*command, timeout=timeout)
 
     async def _exec_internal(
         self,
@@ -327,6 +343,15 @@ class _HostBackedDockerSession(DockerSandboxSession):
             return ExecResult(stdout=b"", stderr=b"", exit_code=0)
         if cmd == ["test", "-x", helper_path]:
             return ExecResult(stdout=b"", stderr=b"", exit_code=0)
+        if cmd[:2] == ["sh", "-c"] and "READ_PATH_PROBE_V3" in cmd[2]:
+            if self._read_probe_exit_code is not None:
+                return ExecResult(
+                    stdout=b"",
+                    stderr=b"",
+                    exit_code=self._read_probe_exit_code,
+                )
+            exists = self._host_path(cmd[4]).exists()
+            return ExecResult(stdout=b"", stderr=b"", exit_code=0 if exists else 1)
         if cmd and cmd[0] == helper_path:
             for_write = cmd[3]
             candidate = self._host_path(cmd[2]).resolve(strict=False)
@@ -677,9 +702,94 @@ async def test_docker_persist_workspace_defers_stage_cleanup_until_archive_close
     assert session.stage_cleanup_calls == []
 
     _ = archive.read()
-    await asyncio.sleep(0)
+    await session._wait_for_cleanup_tasks()
 
     assert session.stage_cleanup_calls == [session.last_staging_parent]
+    assert session._cleanup_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_docker_shutdown_drains_deferred_cleanup_before_backend_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_root = tmp_path / "container"
+    host_root.mkdir()
+    session = _CleanupTrackingDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+    )
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    events: list[str] = []
+
+    async def blocked_cleanup(_path: Path) -> None:
+        cleanup_started.set()
+        await release_cleanup.wait()
+        events.append("cleanup")
+
+    async def shutdown_backend() -> None:
+        events.append("shutdown")
+
+    monkeypatch.setattr(session, "_rm_best_effort", blocked_cleanup)
+    monkeypatch.setattr(session, "_shutdown_backend", shutdown_backend)
+
+    session._schedule_rm_best_effort(Path("/tmp/stage"))
+    await cleanup_started.wait()
+
+    shutdown_task = asyncio.create_task(session.shutdown())
+    await asyncio.sleep(0)
+
+    assert events == []
+
+    release_cleanup.set()
+    await shutdown_task
+
+    assert events == ["cleanup", "shutdown"]
+    assert session._cleanup_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_docker_after_stop_bounds_deferred_cleanup_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_root = tmp_path / "container"
+    host_root.mkdir()
+    session = _CleanupTrackingDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+    )
+    cleanup_started = asyncio.Event()
+    cleanup_cancelled = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def stalled_cleanup(_path: Path) -> None:
+        cleanup_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_cancelled.set()
+            await release_cleanup.wait()
+
+    monkeypatch.setattr(docker_sandbox, "_DEFERRED_CLEANUP_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(session, "_rm_best_effort", stalled_cleanup)
+
+    session._schedule_rm_best_effort(Path("/tmp/stage"))
+    cleanup_task = next(iter(session._cleanup_tasks))
+    await cleanup_started.wait()
+
+    await asyncio.wait_for(session._after_stop(), timeout=0.5)
+    await asyncio.wait_for(cleanup_cancelled.wait(), timeout=0.5)
+
+    assert cleanup_task in session._cleanup_tasks
+    assert not cleanup_task.done()
+
+    release_cleanup.set()
+    await cleanup_task
+    await asyncio.sleep(0)
+
+    assert session._cleanup_tasks == set()
 
 
 def test_docker_start_exec_socket_closes_underlying_http_response() -> None:
@@ -702,6 +812,260 @@ def test_docker_start_exec_socket_closes_underlying_http_response() -> None:
 
     assert api.sock.close_calls == 1
     assert api.response.close_calls == 1
+
+
+class _RecordingStreamSocket:
+    """Exec socket that records stdin bytes and returns EOF immediately, as a
+    real daemon does once the (length-bounded) in-container command exits."""
+
+    def __init__(self) -> None:
+        self.sent = bytearray()
+        self.shutdown_calls: list[int] = []
+        self.closed = False
+
+    @property
+    def _sock(self) -> _RecordingStreamSocket:
+        return self
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.extend(data)
+
+    def shutdown(self, how: int) -> None:
+        self.shutdown_calls.append(how)
+
+    def recv(self, _n: int) -> bytes:
+        return b""
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _RecordingStreamAPI:
+    def __init__(self) -> None:
+        self.exec_create_calls: list[dict[str, object]] = []
+        self.sock = _RecordingStreamSocket()
+
+    def exec_create(self, container_id: str, cmd: list[str], **kwargs: object) -> dict[str, str]:
+        self.exec_create_calls.append({"container_id": container_id, "cmd": cmd, **kwargs})
+        return {"Id": "exec-stream"}
+
+    def exec_start(self, exec_id: str, *, socket: bool = False, tty: bool = False) -> object:
+        return self.sock
+
+    def exec_inspect(self, exec_id: str) -> dict[str, int]:
+        return {"ExitCode": 0}
+
+
+def _make_streaming_session(api: _RecordingStreamAPI) -> DockerSandboxSession:
+    class _Client:
+        def __init__(self) -> None:
+            self.api = api
+
+    class _Container:
+        def __init__(self) -> None:
+            self.client = _Client()
+            self.id = "container"
+
+    def _coerce(user: object = None) -> str:
+        return ""
+
+    session = object.__new__(DockerSandboxSession)
+    session._container = _Container()
+    session._coerce_exec_user = _coerce  # type: ignore[method-assign]
+    return session
+
+
+@pytest.mark.asyncio
+async def test_stream_into_exec_length_frames_stdin_payload() -> None:
+    """The in-container command is wrapped in ``head -c <n>`` so it terminates on
+    a byte count rather than a stdin half-close (which is unreliable over a TLS
+    DOCKER_HOST — see the DinD hang this guards against). Regression test."""
+    api = _RecordingStreamAPI()
+    session = _make_streaming_session(api)
+    payload = b"hello-\x00\xff-world" * 500  # includes NULs / non-utf8 bytes
+
+    await session._stream_into_exec(
+        cmd=["tar", "-x", "-C", "/workspace"],
+        stream=io.BytesIO(payload),
+        error_path=Path("/workspace"),
+    )
+
+    assert len(api.exec_create_calls) == 1
+    framed = cast("list[str]", api.exec_create_calls[0]["cmd"])
+    assert framed == [
+        "sh",
+        "-c",
+        docker_sandbox._LENGTH_FRAMED_STDIN_SCRIPT,
+        "sh",
+        str(len(payload)),
+        "tar",
+        "-x",
+        "-C",
+        "/workspace",
+    ]
+    # The framing script bounds the read by byte count (`head -c`) and preflights
+    # `head -c` so a missing head OR a POSIX-only head that rejects `-c` is fatal
+    # (exit 98) instead of silently writing an empty file — no temp file involved.
+    assert 'head -c "$n"' in framed[2]
+    assert "head -c 1" in framed[2] and "exit 98" in framed[2]
+    # Exactly the payload is streamed, and the count matches the head -c bound —
+    # so completion never depends on the stdin half-close working.
+    assert bytes(api.sock.sent) == payload
+    assert framed[4] == str(len(api.sock.sent))
+
+
+@pytest.mark.asyncio
+async def test_stream_into_exec_frames_non_seekable_stream() -> None:
+    """A non-seekable stream is buffered so the byte count is still correct."""
+
+    class _NonSeekable(io.RawIOBase):
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+            self._read = False
+
+        def readable(self) -> bool:
+            return True
+
+        def seekable(self) -> bool:
+            return False
+
+        def seek(self, *_a: object, **_k: object) -> int:
+            raise OSError("not seekable")
+
+        def read(self, _size: int = -1) -> bytes:
+            if self._read:
+                return b""
+            self._read = True
+            return self._data
+
+    api = _RecordingStreamAPI()
+    session = _make_streaming_session(api)
+    payload = b"x" * 1234
+
+    await session._stream_into_exec(
+        cmd=["sh", "-lc", 'cat > "$1"', "sh", "/workspace/f"],
+        stream=cast(io.IOBase, _NonSeekable(payload)),
+        error_path=Path("/workspace/f"),
+    )
+
+    framed = cast("list[str]", api.exec_create_calls[0]["cmd"])
+    assert framed[:4] == ["sh", "-c", docker_sandbox._LENGTH_FRAMED_STDIN_SCRIPT, "sh"]
+    assert framed[4] == str(len(payload))
+    assert bytes(api.sock.sent) == payload
+
+
+@pytest.mark.asyncio
+async def test_stream_into_exec_fails_when_stream_ends_before_measured_length() -> None:
+    """If the stream yields fewer bytes than measured (e.g. truncated after
+    _measure_stream), fail loudly and send at most the framed count — never
+    short-feed `head -c` and re-introduce the TLS stdin hang."""
+
+    class _ShrinkingStream(io.RawIOBase):
+        """Reports length 100 via seek/tell but only yields 10 bytes."""
+
+        def __init__(self) -> None:
+            self._pos = 0
+            self._served = False
+
+        def seekable(self) -> bool:
+            return True
+
+        def readable(self) -> bool:
+            return True
+
+        def tell(self) -> int:
+            return self._pos
+
+        def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+            self._pos = 100 if whence == io.SEEK_END else offset
+            return self._pos
+
+        def read(self, _size: int = -1) -> bytes:
+            if self._served:
+                return b""
+            self._served = True
+            return b"x" * 10
+
+    api = _RecordingStreamAPI()
+    session = _make_streaming_session(api)
+
+    with pytest.raises(WorkspaceArchiveWriteError):
+        await session._stream_into_exec(
+            cmd=["sh", "-lc", 'cat > "$1"', "sh", "/workspace/f"],
+            stream=cast(io.IOBase, _ShrinkingStream()),
+            error_path=Path("/workspace/f"),
+        )
+
+    # It framed for 100 bytes but sent at most what the stream produced (10) —
+    # never more than the measured count.
+    framed = cast("list[str]", api.exec_create_calls[0]["cmd"])
+    assert framed[4] == "100"
+    assert len(api.sock.sent) == 10
+
+
+@pytest.mark.asyncio
+async def test_stream_into_exec_clamps_length_when_position_past_end() -> None:
+    """A stream positioned past its end measures to a negative delta; clamp to 0
+    so it never becomes `head -c -N` (which reads to EOF and re-hangs over TLS)."""
+    api = _RecordingStreamAPI()
+    session = _make_streaming_session(api)
+    stream = io.BytesIO(b"abc")
+    stream.seek(10)  # past EOF -> end - start would be negative
+
+    await session._stream_into_exec(
+        cmd=["tar", "-x", "-C", "/workspace"],
+        stream=stream,
+        error_path=Path("/workspace"),
+    )
+
+    framed = cast("list[str]", api.exec_create_calls[0]["cmd"])
+    assert framed[4] == "0"  # not "-7"
+    assert api.sock.sent == bytearray()  # nothing sent; no unbounded read
+
+
+def test_measure_stream_closes_spool_when_copy_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If reading a non-seekable stream into the spool raises, _measure_stream
+    must close the spool itself — the caller never receives it to close."""
+    created: list[object] = []
+
+    class _RecordingSpool:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.closed = False
+
+        def write(self, _data: bytes) -> int:
+            return 0
+
+        def seek(self, *_a: object, **_k: object) -> int:
+            return 0
+
+        def close(self) -> None:
+            self.closed = True
+
+    def _factory(*_a: object, **_k: object) -> _RecordingSpool:
+        spool = _RecordingSpool()
+        created.append(spool)
+        return spool
+
+    monkeypatch.setattr("tempfile.SpooledTemporaryFile", _factory)
+
+    class _ExplodingNonSeekable(io.RawIOBase):
+        def seekable(self) -> bool:
+            return False
+
+        def readable(self) -> bool:
+            return True
+
+        def seek(self, *_a: object, **_k: object) -> int:
+            raise OSError("not seekable")  # forces the spool branch
+
+        def read(self, *_a: object, **_k: object) -> bytes:
+            raise RuntimeError("read boom")
+
+    with pytest.raises(RuntimeError, match="read boom"):
+        docker_sandbox._measure_stream(cast(io.IOBase, _ExplodingNonSeekable()))
+
+    assert created, "expected a spool to be created"
+    assert cast("_RecordingSpool", created[0]).closed, "spool was leaked (not closed)"
 
 
 @pytest.mark.asyncio
@@ -962,6 +1326,62 @@ async def test_docker_read_returns_file_bytes_without_archive_api(tmp_path: Path
 
     assert data.read() == b"hello\x00world"
     assert session._fake_container.archive_calls == []
+
+
+@pytest.mark.asyncio
+async def test_docker_read_missing_path_raises_not_found_error(tmp_path: Path) -> None:
+    host_root = tmp_path / "container"
+    (host_root / "workspace").mkdir(parents=True)
+    session = _HostBackedDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+    )
+
+    with pytest.raises(WorkspaceReadNotFoundError):
+        await session.read(Path("missing.txt"))
+
+
+@pytest.mark.asyncio
+async def test_docker_read_existing_unreadable_path_raises_archive_error(tmp_path: Path) -> None:
+    host_root = tmp_path / "container"
+    unreadable_path = host_root / "workspace" / "directory"
+    unreadable_path.mkdir(parents=True)
+    session = _HostBackedDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+    )
+
+    with pytest.raises(WorkspaceArchiveReadError):
+        await session.read(Path("directory"))
+
+
+@pytest.mark.asyncio
+async def test_docker_read_indeterminate_probe_raises_archive_error(tmp_path: Path) -> None:
+    host_root = tmp_path / "container"
+    (host_root / "workspace").mkdir(parents=True)
+    session = _HostBackedDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+        read_probe_exit_code=2,
+    )
+
+    with pytest.raises(WorkspaceArchiveReadError):
+        await session.read(Path("inaccessible/missing.txt"))
+
+
+@pytest.mark.asyncio
+async def test_docker_read_probe_uses_requested_user(tmp_path: Path) -> None:
+    host_root = tmp_path / "container"
+    (host_root / "workspace").mkdir(parents=True)
+    session = _HostBackedDockerSession(
+        host_root=host_root,
+        manifest=Manifest(root="/workspace"),
+    )
+
+    with pytest.raises(WorkspaceReadNotFoundError):
+        await session.read(Path("missing.txt"), user="sandbox-user")
+
+    assert session._read_probe_users == ["sandbox-user"]
 
 
 @pytest.mark.asyncio

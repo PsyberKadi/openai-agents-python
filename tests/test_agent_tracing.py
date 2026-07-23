@@ -89,7 +89,9 @@ async def test_task_and_turn_spans_export_aggregate_usage():
             input_tokens=10,
             output_tokens=3,
             total_tokens=13,
-            input_tokens_details=InputTokensDetails(cached_tokens=2),
+            input_tokens_details=InputTokensDetails.model_validate(
+                {"cache_write_tokens": 3, "cached_tokens": 2}
+            ),
         )
     )
     agent = Agent(name="test_agent", model=model, tools=[foo_tool])
@@ -116,6 +118,7 @@ async def test_task_and_turn_spans_export_aggregate_usage():
                 "output_tokens": 6,
                 "total_tokens": 26,
                 "cached_input_tokens": 4,
+                "cache_write_input_tokens": 6,
             },
         },
     }
@@ -125,11 +128,13 @@ async def test_task_and_turn_spans_export_aggregate_usage():
             "input_tokens": 10,
             "output_tokens": 3,
             "cached_input_tokens": 2,
+            "cache_write_input_tokens": 3,
         },
         {
             "input_tokens": 10,
             "output_tokens": 3,
             "cached_input_tokens": 2,
+            "cache_write_input_tokens": 3,
         },
     ]
     assert [span["span_data"] for span in turn_spans if span] == [
@@ -144,6 +149,7 @@ async def test_task_and_turn_spans_export_aggregate_usage():
                     "input_tokens": 10,
                     "output_tokens": 3,
                     "cached_input_tokens": 2,
+                    "cache_write_input_tokens": 3,
                 },
             },
         },
@@ -158,6 +164,7 @@ async def test_task_and_turn_spans_export_aggregate_usage():
                     "input_tokens": 10,
                     "output_tokens": 3,
                     "cached_input_tokens": 2,
+                    "cache_write_input_tokens": 3,
                 },
             },
         },
@@ -168,6 +175,7 @@ async def test_task_and_turn_spans_export_aggregate_usage():
         "output_tokens": 6,
         "total_tokens": 26,
         "cached_input_tokens": 4,
+        "cache_write_input_tokens": 6,
     }
 
     assert len(agent_spans) == 1
@@ -183,6 +191,66 @@ async def test_task_and_turn_spans_export_aggregate_usage():
         turn_spans[0]["id"],
         turn_spans[1]["id"],
     ]
+
+
+@pytest.mark.asyncio
+async def test_task_and_turn_spans_can_be_disabled():
+    @function_tool
+    def foo_tool() -> str:
+        return "foo result"
+
+    model = FakeModel(tracing_enabled=True)
+    model.add_multiple_turn_outputs(
+        [
+            [get_function_tool_call("foo_tool", "{}", call_id="call-1")],
+            [get_text_message("done")],
+        ]
+    )
+    agent = Agent(name="test_agent", model=model, tools=[foo_tool])
+
+    result = await Runner.run(
+        agent,
+        input="first_test",
+        run_config=RunConfig(tracing={"include_task_and_turn_spans": False}),
+    )
+
+    spans = fetch_ordered_spans()
+    agent_spans = [span for span in spans if span.span_data.type == "agent"]
+    generation_spans = [span for span in spans if span.span_data.type == "generation"]
+    function_spans = [span for span in spans if span.span_data.type == "function"]
+
+    assert result.final_output == "done"
+    assert not [span for span in spans if span.span_data.type in {"task", "turn"}]
+    assert len(agent_spans) == 1
+    assert agent_spans[0].parent_id is None
+    assert len(generation_spans) == 2
+    assert len(function_spans) == 1
+    assert [span.parent_id for span in generation_spans + function_spans] == [
+        agent_spans[0].span_id,
+        agent_spans[0].span_id,
+        agent_spans[0].span_id,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_and_turn_spans_can_be_explicitly_enabled():
+    agent = Agent(
+        name="test_agent",
+        model=FakeModel(
+            tracing_enabled=True,
+            initial_output=[get_text_message("done")],
+        ),
+    )
+
+    await Runner.run(
+        agent,
+        input="first_test",
+        run_config=RunConfig(tracing={"include_task_and_turn_spans": True}),
+    )
+
+    span_types = [span.span_data.type for span in fetch_ordered_spans()]
+    assert span_types.count("task") == 1
+    assert span_types.count("turn") == 1
 
 
 @pytest.mark.asyncio
@@ -318,8 +386,16 @@ async def test_resumed_run_task_span_usage_is_run_local_delta():
     assert resumed.final_output == "done"
     task_spans = [span.export() for span in fetch_ordered_spans() if span.span_data.type == "task"]
     assert [span["span_data"]["data"]["usage"] for span in task_spans if span] == [
-        {**_usage_metadata(requests=1, input_tokens=10, output_tokens=3), "cached_input_tokens": 0},
-        {**_usage_metadata(requests=1, input_tokens=10, output_tokens=3), "cached_input_tokens": 0},
+        {
+            **_usage_metadata(requests=1, input_tokens=10, output_tokens=3),
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+        },
+        {
+            **_usage_metadata(requests=1, input_tokens=10, output_tokens=3),
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+        },
     ]
 
 
@@ -744,8 +820,16 @@ async def test_resumed_streaming_run_task_span_usage_is_run_local_delta():
     assert resumed.final_output == "done"
     task_spans = [span.export() for span in fetch_ordered_spans() if span.span_data.type == "task"]
     assert [span["span_data"]["data"]["usage"] for span in task_spans if span] == [
-        {**_usage_metadata(requests=1, input_tokens=11, output_tokens=4), "cached_input_tokens": 0},
-        {**_usage_metadata(requests=1, input_tokens=11, output_tokens=4), "cached_input_tokens": 0},
+        {
+            **_usage_metadata(requests=1, input_tokens=11, output_tokens=4),
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+        },
+        {
+            **_usage_metadata(requests=1, input_tokens=11, output_tokens=4),
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+        },
     ]
 
 
@@ -846,6 +930,37 @@ async def test_wrapped_streaming_run_creates_root_task_span():
     assert turn_spans[0]["parent_id"] == agent_spans[0].span_id
     assert len(generation_spans) == 1
     assert generation_spans[0].parent_id == turn_spans[0]["id"]
+
+
+@pytest.mark.asyncio
+async def test_wrapped_streaming_run_can_disable_task_and_turn_spans():
+    agent = Agent(
+        name="test_agent",
+        model=FakeModel(
+            tracing_enabled=True,
+            initial_output=[get_text_message("done")],
+        ),
+    )
+
+    with trace(workflow_name="test_workflow"):
+        result = Runner.run_streamed(
+            agent,
+            input="first_test",
+            run_config=RunConfig(tracing={"include_task_and_turn_spans": False}),
+        )
+        async for _ in result.stream_events():
+            pass
+
+    spans = fetch_ordered_spans()
+    agent_spans = [span for span in spans if span.span_data.type == "agent"]
+    generation_spans = [span for span in spans if span.span_data.type == "generation"]
+
+    assert result.final_output == "done"
+    assert not [span for span in spans if span.span_data.type in {"task", "turn"}]
+    assert len(agent_spans) == 1
+    assert agent_spans[0].parent_id is None
+    assert len(generation_spans) == 1
+    assert generation_spans[0].parent_id == agent_spans[0].span_id
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,7 @@ from agents import (
     TResponseInputItem,
     Usage,
     UserError,
+    _debug,
     tool_namespace,
     tool_output_guardrail,
     trace,
@@ -1017,7 +1018,7 @@ async def test_multiple_tool_calls_surface_hook_failure_over_sibling_cancellatio
             context: RunContextWrapper[Any],
             agent: Agent[Any],
             tool,
-            result: str,
+            result: object,
         ) -> None:
             if tool.name != "ok_tool":
                 return
@@ -1116,7 +1117,7 @@ async def test_function_tool_preserves_contextvar_from_tool_body_to_post_invoke_
             context: RunContextWrapper[Any],
             agent: Agent[Any],
             tool,
-            result: str,
+            result: object,
         ) -> None:
             seen_values.append(("hook", tool_state.get()))
 
@@ -1241,14 +1242,14 @@ async def test_multiple_tool_calls_do_not_run_on_tool_end_for_cancelled_tool():
 
     class RecordingHooks(RunHooks[Any]):
         def __init__(self):
-            self.results: dict[str, str] = {}
+            self.results: dict[str, object] = {}
 
         async def on_tool_end(
             self,
             context: RunContextWrapper[Any],
             agent: Agent[Any],
             tool,
-            result: str,
+            result: object,
         ) -> None:
             self.results[tool.name] = result
             if tool.name == "ok_tool":
@@ -1307,7 +1308,7 @@ async def test_multiple_tool_calls_skip_post_invoke_work_for_cancelled_sibling_t
             context: RunContextWrapper[Any],
             agent: Agent[Any],
             tool,
-            result: str,
+            result: object,
         ) -> None:
             if tool.name == "waiting_tool":
                 on_tool_end_called.set()
@@ -1377,7 +1378,7 @@ async def test_execute_function_tool_calls_parent_cancellation_skips_post_invoke
             context: RunContextWrapper[Any],
             agent: Agent[Any],
             tool,
-            result: str,
+            result: object,
         ) -> None:
             on_tool_end_called.set()
 
@@ -1921,7 +1922,7 @@ async def test_multiple_tool_calls_allow_successful_sibling_on_tool_end_to_finis
             context: RunContextWrapper[Any],
             agent: Agent[Any],
             tool,
-            result: str,
+            result: object,
         ) -> None:
             if tool.name != "ok_tool":
                 return
@@ -2814,7 +2815,11 @@ async def test_multiple_final_output_leads_to_final_output_next_step():
 
 
 @pytest.mark.asyncio
-async def test_input_guardrail_runs_on_invalid_json():
+async def test_input_guardrail_runs_on_invalid_json(monkeypatch: pytest.MonkeyPatch):
+    # Opt in to payload logging so the JSON decode error chain is preserved and the
+    # default failure formatter can recover the friendly "parsing tool arguments" message.
+    monkeypatch.setattr(_debug, "DONT_LOG_TOOL_DATA", False)
+
     guardrail_calls: list[str] = []
 
     def guardrail(data) -> ToolGuardrailFunctionOutput:
@@ -2927,6 +2932,14 @@ def make_processed_response(
         tools_used=tools_used or [],
         interruptions=interruptions or [],
     )
+
+
+def test_processed_response_reports_interruptions() -> None:
+    processed_response = make_processed_response(
+        interruptions=[cast(ToolApprovalItem, object())],
+    )
+
+    assert processed_response.has_interruptions() is True
 
 
 async def get_execute_result(
@@ -3129,12 +3142,14 @@ async def test_execute_tools_runs_hosted_mcp_callback_when_present():
         on_approval_request=lambda request: {"approve": True},
     )
     agent = make_agent(tools=[mcp_tool])
-    request_item = McpApprovalRequest(
+    program_caller = {"type": "program", "caller_id": "program-1"}
+    request_item = McpApprovalRequest.model_construct(
         id="mcp-approval-1",
         type="mcp_approval_request",
         server_label="test_mcp_server",
         arguments="{}",
         name="list_repo_languages",
+        caller=program_caller,
     )
     processed_response = make_processed_response(
         new_items=[MCPApprovalRequestItem(raw_item=request_item, agent=agent)],
@@ -3149,7 +3164,11 @@ async def test_execute_tools_runs_hosted_mcp_callback_when_present():
     result = await run_execute_with_processed_response(agent, processed_response)
 
     assert not isinstance(result.next_step, NextStepInterruption)
-    assert any(isinstance(item, MCPApprovalResponseItem) for item in result.new_step_items)
+    responses = [
+        item for item in result.new_step_items if isinstance(item, MCPApprovalResponseItem)
+    ]
+    assert responses
+    assert responses[0].raw_item.get("caller") == program_caller
     assert not result.processed_response or not result.processed_response.interruptions
 
 
@@ -3320,12 +3339,14 @@ async def test_resolve_interrupted_turn_uses_public_agent_for_resumed_hosted_mcp
     public_agent = make_agent(tools=[mcp_tool])
     execution_agent = public_agent.clone()
     set_public_agent(execution_agent, public_agent)
-    request_item = McpApprovalRequest(
+    program_caller = {"type": "program", "caller_id": "program-resume"}
+    request_item = McpApprovalRequest.model_construct(
         id="mcp-approval-resume-public-agent",
         type="mcp_approval_request",
         server_label="test_mcp_server",
         arguments="{}",
         name="list_repo_languages",
+        caller=program_caller,
     )
     approval_item = ToolApprovalItem(
         agent=public_agent,
@@ -3363,6 +3384,7 @@ async def test_resolve_interrupted_turn_uses_public_agent_for_resumed_hosted_mcp
     ]
     assert responses
     assert all(item.agent is public_agent for item in responses)
+    assert all(item.raw_item.get("caller") == program_caller for item in responses)
 
 
 @pytest.mark.asyncio

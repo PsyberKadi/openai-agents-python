@@ -70,7 +70,7 @@ If you do not need access to files or a living filesystem, keep using `Agent`. I
 
 ## Choose a sandbox client
 
-Start with `UnixLocalSandboxClient` for local development. Move to `DockerSandboxClient` when you need container isolation or image parity. Move to a hosted provider when you need provider-managed execution.
+Start with `UnixLocalSandboxClient` for local development on macOS or Linux. On Windows, use `DockerSandboxClient` or a hosted provider instead. On any supported platform, move to `DockerSandboxClient` when you need container isolation or image parity, or to a hosted provider when you need provider-managed execution.
 
 In most cases, the `SandboxAgent` definition stays the same while the sandbox client and its options change in [`SandboxRunConfig`][agents.run_config.SandboxRunConfig]. See [Sandbox clients](clients.md) for local, Docker, hosted, and remote-mount options.
 
@@ -93,7 +93,7 @@ The main SDK pieces map onto those layers like this:
 | Piece | What it owns | Ask this question |
 | --- | --- | --- |
 | [`SandboxAgent`][agents.sandbox.sandbox_agent.SandboxAgent] | The agent definition | What should this agent do, and which defaults should travel with it? |
-| [`Manifest`][agents.sandbox.manifest.Manifest] | Fresh-session workspace files and folders | What files and folder should be present on the filesystem when the run starts? |
+| [`Manifest`][agents.sandbox.manifest.Manifest] | Fresh-session workspace files and folders | What files and folders should be present on the filesystem when the run starts? |
 | [`Capability`][agents.sandbox.capabilities.capability.Capability] | Sandbox-native behavior | Which tools, instruction fragments, or runtime behavior should attach to this agent? |
 | [`SandboxRunConfig`][agents.run_config.SandboxRunConfig] | Per-run sandbox client and sandbox-session source | Should this run inject, resume, or create a sandbox session? |
 | [`RunState`][agents.run_state.RunState] | Runner-managed saved sandbox state | Am I resuming a prior runner-managed workflow and carrying its sandbox state forward automatically? |
@@ -113,17 +113,10 @@ A practical design order is:
 
 At run time, the runner turns that definition into a concrete sandbox-backed run:
 
-1. It resolves the sandbox session from `SandboxRunConfig`.
-   If you pass `session=...`, it reuses that live sandbox session.
-   Otherwise it uses `client=...` to create or resume one.
-2. It determines the effective workspace inputs for the run.
-   If the run injects or resumes a sandbox session, that existing sandbox state wins.
-   Otherwise the runner starts from a one-off manifest override or `agent.default_manifest`.
-   This is why `Manifest` alone does not define the final live workspace for every run.
-3. It lets capabilities process the resulting manifest.
-   This is how capabilities can add files, mounts, or other workspace-scoped behavior before the final agent is prepared.
-4. It builds the final instructions in a fixed order:
-   the SDK's default sandbox prompt, or `base_instructions` if you explicitly override it, then `instructions`, then capability instruction fragments, then any remote-mount policy text, then a rendered filesystem tree.
+1. It resolves the sandbox session from `SandboxRunConfig`. If you pass `session=...`, it reuses that live sandbox session. Otherwise it uses `client=...` to create or resume one.
+2. It determines the effective workspace inputs for the run. If the run injects or resumes a sandbox session, that existing sandbox state wins. Otherwise the runner starts from a one-off manifest override or `agent.default_manifest`. This is why `Manifest` alone does not define the final live workspace for every run.
+3. It lets capabilities process the resulting manifest. This is how capabilities can add files, mounts, or other workspace-scoped behavior before the final agent is prepared.
+4. It builds the final instructions in a fixed order: the SDK's default sandbox prompt, or `base_instructions` if you explicitly override it, then `instructions`, then capability instruction fragments, then any remote-mount policy text, then a rendered filesystem tree.
 5. It binds capability tools to the live sandbox session and runs the prepared agent through the normal `Runner` APIs.
 
 Sandboxing does not change what a turn means. A turn is still a model step, not a single shell command or sandbox action. There is no fixed 1:1 mapping between sandbox-side operations and turns: some work may stay inside the sandbox execution layer, while other actions return tool results, approvals, or other state that requires another model step. As a practical rule, another turn is consumed only when the agent runtime needs another model response after sandbox work has happened.
@@ -272,7 +265,7 @@ from agents.sandbox import FileMode, Permissions
 from agents.sandbox.entries import File
 
 private_notes = File(
-    text="internal notes",
+    content=b"internal notes",
     permissions=Permissions(
         owner=FileMode.READ | FileMode.WRITE,
         group=FileMode.NONE,
@@ -563,7 +556,7 @@ async def main(model: str, prompt: str) -> None:
 if __name__ == "__main__":
     asyncio.run(
         main(
-            model="gpt-5.5",
+            model="gpt-5.6-sol",
             prompt=(
                 "Open `repo/task.md`, use the `$credit-note-fixer` skill, fix the bug, "
                 f"run `{TARGET_TEST_CMD}`, and summarize the change."
@@ -780,8 +773,13 @@ When a tool-agent needs real isolation instead, give it its own sandbox `RunConf
 from docker import from_env as docker_from_env
 
 from agents.run import RunConfig
-from agents.sandbox import SandboxRunConfig
+from agents.sandbox import SandboxAgent, SandboxRunConfig
 from agents.sandbox.sandboxes.docker import DockerSandboxClient, DockerSandboxClientOptions
+
+rollout_agent = SandboxAgent(
+    name="Rollout Reviewer",
+    instructions="Inspect the rollout packet and summarize implementation risk.",
+)
 
 rollout_agent.as_tool(
     tool_name="review_rollout_risk",
@@ -853,7 +851,7 @@ Approval behavior follows the same split:
 
 ## Further reading
 
-- [Quickstart](quickstart.md): get one sandbox agent running.
+- [Quickstart](../sandbox_agents.md): get one sandbox agent running.
 - [Sandbox clients](clients.md): choose local, Docker, hosted, and mount options.
 - [Agent memory](memory.md): preserve and reuse lessons from prior sandbox runs.
 - [examples/sandbox/](https://github.com/openai/openai-agents-python/tree/main/examples/sandbox): runnable local, coding, memory, handoff, and agent-composition patterns.

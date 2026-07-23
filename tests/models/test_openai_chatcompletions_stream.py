@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 import pytest
+from openai.types.chat.chat_completion import ChatCompletion, Choice as ChatCompletionChoice
 from openai.types.chat.chat_completion_chunk import (
     ChatCompletionChunk,
     Choice,
@@ -11,6 +12,7 @@ from openai.types.chat.chat_completion_chunk import (
     ChoiceDeltaToolCallFunction,
     ChoiceLogprobs,
 )
+from openai.types.chat.chat_completion_message import ChatCompletionMessage
 from openai.types.chat.chat_completion_token_logprob import (
     ChatCompletionTokenLogprob,
     TopLogprob,
@@ -27,14 +29,25 @@ from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputRefusal,
     ResponseOutputText,
+    ResponseReasoningItem,
 )
 
-from agents.exceptions import UserError
+from agents import Agent, Runner, function_tool
+from agents.exceptions import ModelBehaviorError, UserError
 from agents.model_settings import ModelSettings
-from agents.models.chatcmpl_stream_handler import ChatCmplStreamHandler
+from agents.models.chatcmpl_stream_handler import (
+    ChatCmplStreamHandler,
+    Part,
+    SequenceNumber,
+    StreamingState,
+    _BufferedToolCall,
+    _merge_buffered_metadata,
+    _StreamOutputLayout,
+)
 from agents.models.interface import ModelTracing
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 from agents.models.openai_provider import OpenAIProvider
+from tests.utils.simple_session import SimpleListSession
 
 
 async def _empty_chat_completion_stream() -> AsyncIterator[ChatCompletionChunk]:
@@ -54,6 +67,36 @@ def _empty_response() -> Response:
         tools=[],
         parallel_tool_calls=False,
     )
+
+
+async def _completion_stream(
+    *chunks: ChatCompletionChunk,
+) -> AsyncIterator[ChatCompletionChunk]:
+    for chunk in chunks:
+        yield chunk
+
+
+async def _collect_handler_events(
+    *chunks: ChatCompletionChunk,
+    model: str | None = None,
+) -> list[Any]:
+    return [
+        event
+        async for event in ChatCmplStreamHandler.handle_stream(
+            _empty_response(), cast(Any, _completion_stream(*chunks)), model=model
+        )
+    ]
+
+
+async def _collect_buffered_tool_call_chunks(
+    *chunks: ChatCompletionChunk,
+) -> list[ChatCompletionChunk]:
+    return [
+        chunk
+        async for chunk in ChatCmplStreamHandler.buffer_tool_call_stream(
+            _completion_stream(*chunks)
+        )
+    ]
 
 
 @pytest.mark.allow_call_model_methods
@@ -83,7 +126,9 @@ async def test_stream_response_yields_events_for_text_content(monkeypatch) -> No
             completion_tokens=5,
             prompt_tokens=7,
             total_tokens=12,
-            prompt_tokens_details=PromptTokensDetails(cached_tokens=2),
+            prompt_tokens_details=PromptTokensDetails.model_validate(
+                {"cached_tokens": 2, "cache_write_tokens": 4}
+            ),
             completion_tokens_details=CompletionTokensDetails(reasoning_tokens=3),
         ),
     )
@@ -154,7 +199,68 @@ async def test_stream_response_yields_events_for_text_content(monkeypatch) -> No
     assert completed_resp.usage.output_tokens == 5
     assert completed_resp.usage.total_tokens == 12
     assert completed_resp.usage.input_tokens_details.cached_tokens == 2
+    assert getattr(completed_resp.usage.input_tokens_details, "cache_write_tokens", None) == 4
     assert completed_resp.usage.output_tokens_details.reasoning_tokens == 3
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_close_closes_provider_stream_with_async_close(
+    monkeypatch,
+) -> None:
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="Hi"))],
+    )
+
+    class ClosableChatStream:
+        def __init__(self) -> None:
+            self._yielded = False
+            self.close_calls = 0
+
+        def __aiter__(self) -> "ClosableChatStream":
+            return self
+
+        async def __anext__(self) -> ChatCompletionChunk:
+            if self._yielded:
+                raise StopAsyncIteration
+            self._yielded = True
+            return chunk
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    provider_stream = ClosableChatStream()
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), provider_stream
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+
+    stream = model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    )
+    stream_agen = cast(Any, stream)
+
+    event = await stream_agen.__anext__()
+    assert event.type == "response.created"
+
+    await stream_agen.aclose()
+
+    assert provider_stream.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -290,6 +396,415 @@ async def test_stream_handler_rejects_nonzero_choice_index_in_strict_mode() -> N
             _empty_response(), cast(Any, fake_stream()), strict_feature_validation=True
         ):
             pass
+
+
+@pytest.mark.asyncio
+async def test_buffer_tool_call_stream_merges_provider_metadata() -> None:
+    tool_call_delta1 = ChoiceDeltaToolCall(
+        index=0,
+        id="tool-id",
+        function=ChoiceDeltaToolCallFunction(name="my_func", arguments='{"a":'),
+        type="function",
+    )
+    tool_call_delta1_any = cast(Any, tool_call_delta1)
+    tool_call_delta1_any.provider_specific_fields = {
+        "nested": {"keep": "provider", "stable": {"value": 1}},
+        "replace": "old",
+    }
+    tool_call_delta1_any.extra_content = {
+        "google": {"thought_signature": "sig-1", "stable": {"value": "kept"}}
+    }
+    tool_call_delta2 = ChoiceDeltaToolCall(
+        index=0,
+        id=None,
+        function=ChoiceDeltaToolCallFunction(name=None, arguments="1}"),
+        type="function",
+    )
+    tool_call_delta2_any = cast(Any, tool_call_delta2)
+    tool_call_delta2_any.provider_specific_fields = {
+        "nested": {"stable": {}, "new": "provider"},
+        "replace": "new",
+    }
+    tool_call_delta2_any.extra_content = {"google": {"stable": {}, "new": "extra"}}
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_delta1]))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_delta2]))],
+    )
+
+    buffered_chunks = await _collect_buffered_tool_call_chunks(chunk1, chunk2)
+
+    assert len(buffered_chunks) == 1
+    buffered_delta = buffered_chunks[0].choices[0].delta
+    assert buffered_delta.tool_calls
+    buffered_tool_call = buffered_delta.tool_calls[0]
+    assert buffered_tool_call.function
+    assert buffered_tool_call.function.arguments == '{"a":1}'
+    assert cast(Any, buffered_tool_call).provider_specific_fields == {
+        "nested": {"keep": "provider", "stable": {"value": 1}, "new": "provider"},
+        "replace": "new",
+    }
+    assert cast(Any, buffered_tool_call).extra_content == {
+        "google": {"thought_signature": "sig-1", "stable": {"value": "kept"}, "new": "extra"}
+    }
+
+
+def test_stream_handler_internal_part_stores_text_and_type() -> None:
+    part = Part(text="hello", type="output_text")
+
+    assert part.text == "hello"
+    assert part.type == "output_text"
+
+
+def test_merge_buffered_metadata_keeps_existing_scalar_when_empty_dict_arrives() -> None:
+    merged = _merge_buffered_metadata(
+        {"stable": "keep-me"},
+        {"stable": {}, "new": {}},
+    )
+
+    assert merged == {"stable": "keep-me", "new": {}}
+
+
+def test_stream_output_layout_rejects_unknown_function_call_index() -> None:
+    layout = _StreamOutputLayout()
+
+    with pytest.raises(KeyError, match="Function call index 9 has not been tracked"):
+        layout.function_call_output_index(StreamingState(), 9)
+
+
+@pytest.mark.parametrize(
+    ("buffered_call", "message"),
+    [
+        (
+            _BufferedToolCall(index=0, name="my_func"),
+            "without a tool call id",
+        ),
+        (
+            _BufferedToolCall(index=0, call_id="tool-id"),
+            "without a function name",
+        ),
+    ],
+)
+def test_buffered_tool_call_delta_requires_id_and_name(
+    buffered_call: _BufferedToolCall,
+    message: str,
+) -> None:
+    with pytest.raises(ModelBehaviorError, match=message):
+        ChatCmplStreamHandler._buffered_tool_call_delta(buffered_call)
+
+
+def test_function_call_item_omits_provider_data_when_absent() -> None:
+    function_call = ResponseFunctionToolCall(
+        id="fake-id",
+        call_id="call-id",
+        arguments="",
+        name="my_func",
+        type="function_call",
+    )
+
+    item = ChatCmplStreamHandler._function_call_item(
+        StreamingState(),
+        function_call,
+        arguments="{}",
+    )
+
+    assert item.arguments == "{}"
+    assert "provider_data" not in item.model_dump()
+
+
+def test_finish_reasoning_summary_part_clears_invalid_active_index() -> None:
+    reasoning_item = ResponseReasoningItem(id="fake-id", summary=[], type="reasoning")
+    state = StreamingState(
+        reasoning_content_index_and_output=(0, reasoning_item),
+        active_reasoning_summary_index=0,
+    )
+
+    events = list(ChatCmplStreamHandler._finish_reasoning_summary_part(state, SequenceNumber()))
+
+    assert events == []
+    assert state.active_reasoning_summary_index is None
+
+
+@pytest.mark.asyncio
+async def test_buffer_tool_call_stream_preserves_empty_choice_chunks() -> None:
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[],
+    )
+
+    buffered_chunks = await _collect_buffered_tool_call_chunks(chunk)
+
+    assert buffered_chunks == [chunk]
+
+
+@pytest.mark.asyncio
+async def test_buffer_tool_call_stream_keeps_passthrough_index_passthrough() -> None:
+    custom_tool_call_delta = ChoiceDeltaToolCall.model_construct(
+        index=0,
+        id="custom-id",
+        type="custom",
+    )
+    function_tool_call_delta = ChoiceDeltaToolCall(
+        index=0,
+        id="function-id",
+        function=ChoiceDeltaToolCallFunction(name="my_func", arguments="{}"),
+        type="function",
+    )
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[custom_tool_call_delta]))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[function_tool_call_delta]))],
+    )
+
+    buffered_chunks = await _collect_buffered_tool_call_chunks(chunk1, chunk2)
+
+    assert len(buffered_chunks) == 2
+    assert buffered_chunks[0].choices[0].delta.tool_calls == [custom_tool_call_delta]
+    assert buffered_chunks[1].choices[0].delta.tool_calls == [function_tool_call_delta]
+
+
+@pytest.mark.parametrize(
+    ("delta", "expected"),
+    [
+        (None, False),
+        (ChoiceDelta(), False),
+        (ChoiceDelta(content="text"), True),
+        (ChoiceDelta.model_construct(refusal="blocked"), True),
+        (ChoiceDelta.model_construct(reasoning_content="summary"), True),
+        (ChoiceDelta.model_construct(reasoning="scratchpad"), True),
+        (ChoiceDelta.model_construct(thinking_blocks=[{"thinking": "hidden"}]), True),
+    ],
+)
+def test_stream_handler_detects_passthrough_delta_shapes(
+    delta: ChoiceDelta | None,
+    expected: bool,
+) -> None:
+    assert ChatCmplStreamHandler._delta_has_passthrough_output(delta) is expected
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_ignores_choice_without_delta() -> None:
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice.model_construct(index=0, delta=None)],
+    )
+
+    events = await _collect_handler_events(chunk)
+
+    assert [event.type for event in events] == ["response.created", "response.completed"]
+    completed_event = events[-1]
+    assert isinstance(completed_event, ResponseCompletedEvent)
+    assert completed_event.response.output == []
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_converts_third_party_reasoning_text() -> None:
+    reasoning_delta1 = ChoiceDelta.model_construct(reasoning="think ")
+    reasoning_delta2 = ChoiceDelta.model_construct(reasoning="hard")
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=reasoning_delta1)],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=reasoning_delta2)],
+        ),
+    ]
+
+    events = await _collect_handler_events(*chunks, model="third-party")
+
+    reasoning_delta_events = [
+        event for event in events if event.type == "response.reasoning_text.delta"
+    ]
+    assert [event.delta for event in reasoning_delta_events] == ["think ", "hard"]
+
+    reasoning_done_event = next(
+        event
+        for event in events
+        if event.type == "response.output_item.done"
+        and isinstance(event.item, ResponseReasoningItem)
+    )
+    reasoning_done_item = cast(ResponseReasoningItem, reasoning_done_event.item)
+    assert reasoning_done_item.content
+    assert cast(Any, reasoning_done_item.content[0]).text == "think hard"
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    assert isinstance(completed_event, ResponseCompletedEvent)
+    completed_reasoning_item = completed_event.response.output[0]
+    assert isinstance(completed_reasoning_item, ResponseReasoningItem)
+    assert completed_reasoning_item.content
+    assert cast(Any, completed_reasoning_item.content[0]).text == "think hard"
+    assert completed_reasoning_item.model_dump().get("provider_data") == {
+        "model": "third-party",
+        "response_id": "chunk-id",
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_preserves_thinking_blocks_with_reasoning_summary() -> None:
+    delta = ChoiceDelta.model_construct(
+        reasoning_content="summary",
+        thinking_blocks=[
+            {"thinking": "hidden one ", "signature": "sig-1"},
+            {"thinking": "hidden two", "signature": "sig-2"},
+        ],
+    )
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=delta)],
+    )
+
+    events = await _collect_handler_events(chunk)
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    reasoning_item = completed_event.response.output[0]
+    assert isinstance(reasoning_item, ResponseReasoningItem)
+    assert reasoning_item.summary[0].text == "summary"
+    assert reasoning_item.content
+    assert cast(Any, reasoning_item.content[0]).text == "hidden one hidden two"
+    assert reasoning_item.encrypted_content == "sig-2"
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_adds_third_party_reasoning_text_to_summary_item() -> None:
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[
+                Choice(index=0, delta=ChoiceDelta.model_construct(reasoning_content="summary"))
+            ],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta.model_construct(reasoning="details"))],
+        ),
+    ]
+
+    events = await _collect_handler_events(*chunks)
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    reasoning_item = completed_event.response.output[0]
+    assert isinstance(reasoning_item, ResponseReasoningItem)
+    assert reasoning_item.summary[0].text == "summary"
+    assert reasoning_item.content
+    assert cast(Any, reasoning_item.content[0]).text == "details"
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_orders_refusal_after_reasoning_and_text() -> None:
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[
+                Choice(index=0, delta=ChoiceDelta.model_construct(reasoning_content="summary"))
+            ],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta(content="partial"))],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta.model_construct(refusal="blocked"))],
+        ),
+    ]
+
+    events = await _collect_handler_events(*chunks)
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    assistant_item = completed_event.response.output[1]
+    assert isinstance(assistant_item, ResponseOutputMessage)
+    assert isinstance(assistant_item.content[0], ResponseOutputText)
+    assert isinstance(assistant_item.content[1], ResponseOutputRefusal)
+    assert assistant_item.content[0].text == "partial"
+    assert assistant_item.content[1].refusal == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_stream_handler_places_text_after_existing_refusal_part() -> None:
+    chunks = [
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta.model_construct(refusal="blocked"))],
+        ),
+        ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[Choice(index=0, delta=ChoiceDelta(content="partial"))],
+        ),
+    ]
+
+    events = await _collect_handler_events(*chunks)
+
+    text_part_added = next(
+        event
+        for event in events
+        if event.type == "response.content_part.added"
+        and isinstance(event.part, ResponseOutputText)
+    )
+    assert text_part_added.content_index == 1
+
+    completed_event = next(event for event in events if event.type == "response.completed")
+    assistant_item = completed_event.response.output[0]
+    assert isinstance(assistant_item, ResponseOutputMessage)
+    assert isinstance(assistant_item.content[0], ResponseOutputText)
+    assert isinstance(assistant_item.content[1], ResponseOutputRefusal)
+    assert assistant_item.content[0].text == "partial"
+    assert assistant_item.content[1].refusal == "blocked"
 
 
 @pytest.mark.allow_call_model_methods
@@ -596,6 +1111,82 @@ async def test_stream_response_includes_logprobs(monkeypatch) -> None:
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
+async def test_stream_response_accumulates_logprobs_across_many_deltas(monkeypatch) -> None:
+    # Each content delta carries its own logprobs, and the streamed output text part must
+    # accumulate all of them in order across the whole stream.
+    tokens = ["a", "b", "c", "d", "e"]
+
+    def make_chunk(token: str) -> ChatCompletionChunk:
+        return ChatCompletionChunk(
+            id="chunk-id",
+            created=1,
+            model="fake",
+            object="chat.completion.chunk",
+            choices=[
+                Choice(
+                    index=0,
+                    delta=ChoiceDelta(content=token),
+                    logprobs=ChoiceLogprobs(
+                        content=[
+                            ChatCompletionTokenLogprob(
+                                token=token,
+                                logprob=-0.5,
+                                bytes=[1],
+                                top_logprobs=[TopLogprob(token=token, logprob=-0.5, bytes=[1])],
+                            )
+                        ]
+                    ),
+                )
+            ],
+        )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        for token in tokens:
+            yield make_chunk(token)
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        resp = Response(
+            id="resp-id",
+            created_at=0,
+            model="fake-model",
+            object="response",
+            output=[],
+            tool_choice="none",
+            tools=[],
+            parallel_tool_calls=False,
+        )
+        return resp, fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+    output_events = []
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    completed_event = next(event for event in output_events if event.type == "response.completed")
+    assert isinstance(completed_event, ResponseCompletedEvent)
+    completed_resp = completed_event.response
+    assert isinstance(completed_resp.output[0], ResponseOutputMessage)
+    text_part = completed_resp.output[0].content[0]
+    assert isinstance(text_part, ResponseOutputText)
+    assert text_part.text == "".join(tokens)
+    assert text_part.logprobs is not None
+    assert [lp.token for lp in text_part.logprobs] == tokens
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
 async def test_stream_response_yields_events_for_refusal_content(monkeypatch) -> None:
     """
     Validate that when the model streams a refusal string instead of normal content,
@@ -767,6 +1358,614 @@ async def test_stream_response_yields_events_for_tool_call(monkeypatch) -> None:
     assert isinstance(final_fn, ResponseFunctionToolCall)
     assert final_fn.name == "my_func"
     assert final_fn.arguments == "arg1arg2"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_buffers_tool_call_deltas_when_enabled(monkeypatch) -> None:
+    tool_call_delta1 = ChoiceDeltaToolCall(
+        index=0,
+        id="tool-id",
+        function=ChoiceDeltaToolCallFunction(name="my_func", arguments="arg1"),
+        type="function",
+    )
+    tool_call_delta2 = ChoiceDeltaToolCall(
+        index=0,
+        id=None,
+        function=ChoiceDeltaToolCallFunction(name=None, arguments="arg2"),
+        type="function",
+    )
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_delta1]))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_delta2]))],
+        usage=CompletionUsage(completion_tokens=1, prompt_tokens=1, total_tokens=2),
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        for chunk in (chunk1, chunk2):
+            yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(
+        use_responses=False,
+        buffer_streamed_tool_calls=True,
+    ).get_model("gpt-4")
+
+    output_events = []
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    argument_delta_events = [
+        event for event in output_events if event.type == "response.function_call_arguments.delta"
+    ]
+    assert len(argument_delta_events) == 1
+    assert argument_delta_events[0].delta == "arg1arg2"
+
+    done_event = next(event for event in output_events if event.type == "response.output_item.done")
+    final_fn = done_event.item
+    assert isinstance(final_fn, ResponseFunctionToolCall)
+    assert final_fn.call_id == "tool-id"
+    assert final_fn.name == "my_func"
+    assert final_fn.arguments == "arg1arg2"
+
+    completed_event = next(event for event in output_events if event.type == "response.completed")
+    assert isinstance(completed_event, ResponseCompletedEvent)
+    assert completed_event.response.usage
+    assert completed_event.response.usage.total_tokens == 2
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_buffered_tool_call_before_text_replays_as_single_assistant_session_message() -> None:
+    tool_call_delta = ChoiceDeltaToolCall(
+        index=0,
+        id="call_lookup_status",
+        function=ChoiceDeltaToolCallFunction(name="lookup_status", arguments="{}"),
+        type="function",
+    )
+    tool_first_chunk = ChatCompletionChunk(
+        id="chunk-tool",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_delta]))],
+    )
+    later_text_chunk = ChatCompletionChunk(
+        id="chunk-text",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[
+            Choice(
+                index=0,
+                delta=ChoiceDelta(content="I'll look that up first."),
+            )
+        ],
+        usage=CompletionUsage(completion_tokens=5, prompt_tokens=5, total_tokens=10),
+    )
+    final_text_chunk = ChatCompletionChunk(
+        id="chunk-final",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="first run done"))],
+        usage=CompletionUsage(completion_tokens=3, prompt_tokens=7, total_tokens=10),
+    )
+
+    async def first_turn_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield tool_first_chunk
+        yield later_text_chunk
+
+    async def final_turn_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield final_text_chunk
+
+    class DummyCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            call_number = len(self.calls)
+
+            if kwargs["stream"] is True:
+                if call_number == 1:
+                    return first_turn_stream()
+                if call_number == 2:
+                    return final_turn_stream()
+                raise AssertionError(f"Unexpected streamed call {call_number}")
+
+            return ChatCompletion(
+                id="resp-id",
+                created=0,
+                model="fake",
+                object="chat.completion",
+                choices=[
+                    ChatCompletionChoice(
+                        index=0,
+                        finish_reason="stop",
+                        message=ChatCompletionMessage(
+                            role="assistant",
+                            content="second run done",
+                        ),
+                    )
+                ],
+                usage=None,
+            )
+
+    class DummyClient:
+        def __init__(self, completions: DummyCompletions) -> None:
+            self.chat = type("_Chat", (), {"completions": completions})()
+            self.base_url = "http://fake"
+
+    def lookup_status() -> str:
+        return "lookup result"
+
+    completions = DummyCompletions()
+    model = OpenAIChatCompletionsModel(
+        model="gpt-4",
+        openai_client=DummyClient(completions),  # type: ignore[arg-type]
+        buffer_streamed_tool_calls=True,
+    )
+    agent = Agent(
+        name="test",
+        model=model,
+        tools=[function_tool(lookup_status, name_override="lookup_status")],
+    )
+    session = SimpleListSession()
+
+    first_result = Runner.run_streamed(agent, input="first question", session=session)
+    async for _ in first_result.stream_events():
+        pass
+
+    assert first_result.final_output == "first run done"
+    await Runner.run(agent, input="second question", session=session)
+
+    assert len(completions.calls) == 3
+    replayed_messages = completions.calls[2]["messages"]
+    assert [message["role"] for message in replayed_messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+        "user",
+    ]
+
+    assistant_with_tool = cast(dict[str, Any], replayed_messages[1])
+    assert assistant_with_tool["content"] == "I'll look that up first."
+    assert len(assistant_with_tool["tool_calls"]) == 1
+    tool_call = assistant_with_tool["tool_calls"][0]
+    assert tool_call["id"] == "call_lookup_status"
+    assert tool_call["function"] == {"name": "lookup_status", "arguments": "{}"}
+
+    tool_message = cast(dict[str, Any], replayed_messages[2])
+    assert tool_message["tool_call_id"] == "call_lookup_status"
+    assert tool_message["content"] == "lookup result"
+    assert replayed_messages[3]["content"] == "first run done"
+    assert replayed_messages[4]["content"] == "second question"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_buffers_tool_call_usage_chunk_without_replay(
+    monkeypatch,
+) -> None:
+    tool_call_delta = ChoiceDeltaToolCall(
+        index=0,
+        id="tool-id",
+        function=ChoiceDeltaToolCallFunction(name="my_func", arguments="arg1"),
+        type="function",
+    )
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_delta]))],
+        usage=CompletionUsage(completion_tokens=1, prompt_tokens=1, total_tokens=2),
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(
+        use_responses=False,
+        buffer_streamed_tool_calls=True,
+    ).get_model("gpt-4")
+
+    output_events = []
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    argument_delta_events = [
+        event for event in output_events if event.type == "response.function_call_arguments.delta"
+    ]
+    assert len(argument_delta_events) == 1
+    assert argument_delta_events[0].delta == "arg1"
+
+    function_done_events = [
+        event
+        for event in output_events
+        if event.type == "response.output_item.done"
+        and isinstance(event.item, ResponseFunctionToolCall)
+    ]
+    assert len(function_done_events) == 1
+
+    completed_event = next(event for event in output_events if event.type == "response.completed")
+    assert isinstance(completed_event, ResponseCompletedEvent)
+    assert completed_event.response.usage
+    assert completed_event.response.usage.total_tokens == 2
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_buffers_tool_call_provider_fields(monkeypatch) -> None:
+    tool_call_delta1 = ChoiceDeltaToolCall(
+        index=0,
+        id="tool-id",
+        function=ChoiceDeltaToolCallFunction(name="my_func", arguments=None),
+        type="function",
+    )
+    cast(Any, tool_call_delta1).provider_specific_fields = {"thought_signature": "thought-sig"}
+    tool_call_delta2 = ChoiceDeltaToolCall(
+        index=0,
+        id=None,
+        function=ChoiceDeltaToolCallFunction(name=None, arguments="arg1"),
+        type="function",
+    )
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="gemini/gemini-3-pro",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_delta1]))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="gemini/gemini-3-pro",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_delta2]))],
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        for chunk in (chunk1, chunk2):
+            yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(
+        use_responses=False,
+        buffer_streamed_tool_calls=True,
+    ).get_model("gemini/gemini-3-pro")
+
+    output_events = []
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    function_done_events = [
+        event
+        for event in output_events
+        if event.type == "response.output_item.done"
+        and isinstance(event.item, ResponseFunctionToolCall)
+    ]
+    assert len(function_done_events) == 1
+    provider_data = function_done_events[0].item.model_dump().get("provider_data", {})
+    assert provider_data["thought_signature"] == "thought-sig"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_buffered_tool_calls_raise_for_missing_tool_call_delta(
+    monkeypatch,
+) -> None:
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(), finish_reason="tool_calls")],
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(
+        use_responses=False,
+        buffer_streamed_tool_calls=True,
+    ).get_model("gpt-4")
+
+    with pytest.raises(ModelBehaviorError, match="finish_reason='tool_calls'"):
+        async for _event in model.stream_response(
+            system_instructions=None,
+            input="",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ):
+            pass
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_buffered_tool_calls_preserve_nonzero_choice_validation(monkeypatch) -> None:
+    tool_call_delta = ChoiceDeltaToolCall(
+        index=0,
+        id="tool-id",
+        function=ChoiceDeltaToolCallFunction(name="my_func", arguments="arg"),
+        type="function",
+    )
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=1, delta=ChoiceDelta(tool_calls=[tool_call_delta]))],
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(
+        use_responses=False,
+        strict_feature_validation=True,
+        buffer_streamed_tool_calls=True,
+    ).get_model("gpt-4")
+
+    with pytest.raises(UserError, match="multiple choices or nonzero choice indexes"):
+        async for _event in model.stream_response(
+            system_instructions=None,
+            input="",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ):
+            pass
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_buffered_tool_calls_do_not_merge_nonzero_choice_tool_call_indexes(
+    monkeypatch,
+) -> None:
+    choice_zero_tool_call = ChoiceDeltaToolCall(
+        index=0,
+        id="choice-zero-tool-id",
+        function=ChoiceDeltaToolCallFunction(name="choice_zero_func", arguments="choice-zero"),
+        type="function",
+    )
+    choice_one_tool_call = ChoiceDeltaToolCall(
+        index=0,
+        id="choice-one-tool-id",
+        function=ChoiceDeltaToolCallFunction(name="choice_one_func", arguments="choice-one"),
+        type="function",
+    )
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[
+            Choice(index=0, delta=ChoiceDelta(tool_calls=[choice_zero_tool_call])),
+            Choice(index=1, delta=ChoiceDelta(tool_calls=[choice_one_tool_call])),
+        ],
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(
+        use_responses=False,
+        buffer_streamed_tool_calls=True,
+    ).get_model("gpt-4")
+
+    output_events = []
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    function_done_events = [
+        event
+        for event in output_events
+        if event.type == "response.output_item.done"
+        and isinstance(event.item, ResponseFunctionToolCall)
+    ]
+    assert len(function_done_events) == 1
+    final_fn = function_done_events[0].item
+    assert isinstance(final_fn, ResponseFunctionToolCall)
+    assert final_fn.call_id == "choice-zero-tool-id"
+    assert final_fn.name == "choice_zero_func"
+    assert final_fn.arguments == "choice-zero"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_buffered_tool_calls_preserve_custom_tool_call_strict_error(
+    monkeypatch,
+) -> None:
+    custom_tool_call_delta = ChoiceDeltaToolCall.model_construct(
+        index=0,
+        id="tool-call-123",
+        type="custom",
+    )
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[
+            Choice(
+                index=0,
+                delta=ChoiceDelta(tool_calls=[custom_tool_call_delta]),
+                finish_reason="tool_calls",
+            )
+        ],
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(
+        use_responses=False,
+        strict_feature_validation=True,
+        buffer_streamed_tool_calls=True,
+    ).get_model("gpt-4")
+
+    with pytest.raises(UserError, match="Custom tool calls are not supported"):
+        async for _event in model.stream_response(
+            system_instructions=None,
+            input="",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ):
+            pass
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_buffered_tool_calls_ignore_custom_tool_call_by_default(monkeypatch) -> None:
+    custom_tool_call_delta = ChoiceDeltaToolCall.model_construct(
+        index=0,
+        id="tool-call-123",
+        type="custom",
+    )
+    chunk = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[
+            Choice(
+                index=0,
+                delta=ChoiceDelta(tool_calls=[custom_tool_call_delta]),
+                finish_reason="tool_calls",
+            )
+        ],
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        return _empty_response(), fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(
+        use_responses=False,
+        buffer_streamed_tool_calls=True,
+    ).get_model("gpt-4")
+
+    output_events = []
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    completed_event = next(event for event in output_events if event.type == "response.completed")
+    assert isinstance(completed_event, ResponseCompletedEvent)
+    assert completed_event.response.output == []
 
 
 @pytest.mark.allow_call_model_methods

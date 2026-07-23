@@ -62,6 +62,7 @@ from ..models._response_terminal import (
     response_error_event_failure_error,
     response_terminal_failure_error,
 )
+from ..models._run_context import model_run_context, model_run_context_stream
 from ..result import RunResultStreaming
 from ..run_config import ReasoningItemIdPolicy, RunConfig
 from ..run_context import AgentHookContext, RunContextWrapper, TContext
@@ -75,6 +76,7 @@ from ..stream_events import (
 )
 from ..tool import (
     FunctionTool,
+    ProgrammaticToolCallingTool,
     Tool,
     ToolOrigin,
     ToolOriginType,
@@ -82,9 +84,10 @@ from ..tool import (
     get_function_tool_origin,
 )
 from ..tracing import Span, SpanError, agent_span, get_current_trace, task_span, turn_span
+from ..tracing.config import include_task_and_turn_spans
 from ..tracing.model_tracing import get_model_tracing_impl
 from ..tracing.span_data import AgentSpanData, TaskSpanData
-from ..usage import Usage
+from ..usage import Usage, _response_usage_to_usage
 from ..util import _coro, _error_tracing
 from .agent_bindings import AgentBindings, bind_public_agent
 from .agent_runner_helpers import (
@@ -117,6 +120,7 @@ from .items import (
     ensure_input_item_format,
     normalize_resumed_input,
     prepare_model_input_items,
+    reconcile_nested_history_owned_input_after_rewrite,
     run_items_to_input_items,
 )
 from .model_retry import (
@@ -145,6 +149,7 @@ from .run_steps import (
 from .session_persistence import (
     persist_session_items_for_guardrail_trip,
     prepare_input_with_session,
+    reconcile_nested_history_owned_session_item_refs,
     resumed_turn_items,
     rewind_session_items,
     save_result_to_session,
@@ -241,6 +246,7 @@ __all__ = [
     "check_for_final_output_from_tools",
     "get_model_tracing_impl",
     "validate_run_hooks",
+    "cleanup_models_after_run",
     "maybe_filter_model_input",
     "run_input_guardrails_with_queue",
     "start_streaming",
@@ -256,6 +262,15 @@ __all__ = [
     "get_model",
     "input_guardrail_tripwire_triggered_for_stream",
 ]
+
+
+async def cleanup_models_after_run(tool_use_tracker: AgentToolUseTracker) -> None:
+    """Notify every model resolved during the run that its owning run has ended."""
+    for model in tool_use_tracker.models:
+        try:
+            await model._cleanup_on_run_end(tool_use_tracker)
+        except Exception as error:
+            logger.warning("Failed to clean up model resources after run: %s", error)
 
 
 def _should_attach_generic_agent_error(exc: Exception) -> bool:
@@ -475,8 +490,9 @@ async def start_streaming(
         )
 
     current_trace = streamed_result.trace or get_current_trace()
+    use_task_and_turn_spans = include_task_and_turn_spans(run_config.tracing)
     current_task_span: Span[TaskSpanData] | None = (
-        task_span(name=current_trace.name) if current_trace else None
+        task_span(name=current_trace.name) if current_trace and use_task_and_turn_spans else None
     )
     if current_task_span:
         current_task_span.start(mark_as_current=True)
@@ -537,6 +553,9 @@ async def start_streaming(
             streamed_result._state = run_state
         if run_state is not None:
             streamed_result._model_input_items = list(run_state._generated_items)
+            streamed_result._nested_history_owned_session_item_refs = list(
+                run_state._nested_history_owned_session_item_refs
+            )
             # Streamed follow-ups need the same normalized replay signal as sync runs when the
             # runner's continuation differs from the richer session history.
             streamed_result._replay_from_model_input_items = list(
@@ -591,6 +610,18 @@ async def start_streaming(
         prepared_input: str | list[TResponseInputItem]
         if is_resumed_state and run_state is not None:
             prepared_input = normalize_resumed_input(starting_input)
+            (
+                prepared_input,
+                run_state._nested_history_owned_session_item_refs,
+            ) = reconcile_nested_history_owned_input_after_rewrite(
+                starting_input,
+                prepared_input,
+                run_state._nested_history_owned_session_item_refs,
+            )
+            run_state._original_input = copy_input_items(prepared_input)
+            streamed_result._nested_history_owned_session_item_refs = list(
+                run_state._nested_history_owned_session_item_refs
+            )
             streamed_result.input = prepared_input
             streamed_result._original_input_for_persistence = []
             streamed_result._stream_input_persisted = True
@@ -712,6 +743,7 @@ async def start_streaming(
                 sequential_guardrails = []
 
             if sandbox_runtime is not None:
+                input_before_sandbox = copy_input_items(prepared_turn_input)
                 prepared_sandbox = await sandbox_runtime.prepare_agent(
                     current_agent=current_agent,
                     current_input=prepared_turn_input,
@@ -720,11 +752,19 @@ async def start_streaming(
                 )
                 current_bindings = prepared_sandbox.bindings
                 execution_agent = current_bindings.execution_agent
-                prepared_turn_input = copy_input_items(prepared_sandbox.input)
+                prepared_turn_input, retained_owned_refs = (
+                    reconcile_nested_history_owned_input_after_rewrite(
+                        input_before_sandbox,
+                        prepared_sandbox.input,
+                        streamed_result._nested_history_owned_session_item_refs,
+                    )
+                )
+                streamed_result._nested_history_owned_session_item_refs = retained_owned_refs
                 streamed_result.input = prepared_turn_input
                 streamed_result._original_input = copy_input_items(prepared_turn_input)
                 if run_state is not None:
                     run_state._original_input = copy_input_items(prepared_turn_input)
+                    run_state._nested_history_owned_session_item_refs = list(retained_owned_refs)
                 sandbox_runtime.apply_result_metadata(streamed_result)
 
             if is_resumed_state and run_state is not None and run_state._current_step is not None:
@@ -759,6 +799,7 @@ async def start_streaming(
                         ),
                     )
 
+                    input_before_turn_rewrite = streamed_result.input
                     streamed_result.input = turn_result.original_input
                     streamed_result._original_input = copy_input_items(turn_result.original_input)
                     generated_items, turn_session_items = resumed_turn_items(turn_result)
@@ -767,6 +808,17 @@ async def start_streaming(
                     )
                     streamed_result._model_input_items = generated_items
                     streamed_result.new_items = base_session_items + list(turn_session_items)
+                    if turn_result.nested_history_owned_items is not None:
+                        owned_refs = reconcile_nested_history_owned_session_item_refs(
+                            streamed_result.new_items,
+                            streamed_result._nested_history_owned_session_item_refs,
+                            input_before_turn_rewrite,
+                            turn_result.original_input,
+                            turn_result.nested_history_owned_items,
+                        )
+                        streamed_result._nested_history_owned_session_item_refs = owned_refs
+                        if run_state is not None:
+                            run_state._nested_history_owned_session_item_refs = list(owned_refs)
                     streamed_result._replay_from_model_input_items = list(
                         streamed_result._model_input_items
                     ) != list(streamed_result.new_items)
@@ -801,6 +853,11 @@ async def start_streaming(
                         break
 
                     if isinstance(turn_result.next_step, NextStepHandoff):
+                        await _save_resumed_items(
+                            list(turn_session_items),
+                            turn_result.model_response.response_id,
+                            store_setting,
+                        )
                         current_agent = turn_result.next_step.new_agent
                         if run_state is not None:
                             run_state._current_agent = current_agent
@@ -848,7 +905,9 @@ async def start_streaming(
                 break
 
             all_tools = await get_all_tools(execution_agent, context_wrapper)
-            await initialize_computer_tools(tools=all_tools, context_wrapper=context_wrapper)
+            all_tools = await initialize_computer_tools(
+                tools=all_tools, context_wrapper=context_wrapper
+            )
 
             if current_span is None:
                 handoff_names = [
@@ -901,6 +960,7 @@ async def start_streaming(
                 )
                 handler_result = await resolve_run_error_handler_result(
                     error_handlers=error_handlers,
+                    error_kind="max_turns",
                     error=max_turns_error,
                     context_wrapper=context_wrapper,
                     run_data=run_error_data,
@@ -1000,11 +1060,16 @@ async def start_streaming(
                     current_agent.name,
                 )
                 turn_usage_start = snapshot_usage(context_wrapper.usage)
-                current_turn_span = turn_span(
-                    turn=current_turn,
-                    agent_name=current_agent.name,
+                current_turn_span = (
+                    turn_span(
+                        turn=current_turn,
+                        agent_name=current_agent.name,
+                    )
+                    if use_task_and_turn_spans
+                    else None
                 )
-                current_turn_span.start(mark_as_current=True)
+                if current_turn_span:
+                    current_turn_span.start(mark_as_current=True)
                 try:
                     if (
                         session is not None
@@ -1028,21 +1093,17 @@ async def start_streaming(
                         server_conversation_tracker,
                         pending_server_items=pending_server_items,
                         session=session,
-                        session_items_to_rewind=(
-                            streamed_result._original_input_for_persistence
-                            if session is not None and server_conversation_tracker is None
-                            else None
-                        ),
                         reasoning_item_id_policy=resolved_reasoning_item_id_policy,
                         prompt_cache_key_resolver=prompt_cache_key_resolver,
                         error_handlers=error_handlers,
                     )
                 finally:
-                    attach_usage_to_span(
-                        current_turn_span,
-                        usage_delta(turn_usage_start, context_wrapper.usage),
-                    )
-                    current_turn_span.finish(reset_current=True)
+                    if current_turn_span:
+                        attach_usage_to_span(
+                            current_turn_span,
+                            usage_delta(turn_usage_start, context_wrapper.usage),
+                        )
+                        current_turn_span.finish(reset_current=True)
                 logger.debug(
                     "Turn %s complete, next_step type=%s",
                     current_turn,
@@ -1061,6 +1122,7 @@ async def start_streaming(
                 streamed_result.raw_responses = streamed_result.raw_responses + [
                     turn_result.model_response
                 ]
+                input_before_turn_rewrite = streamed_result.input
                 streamed_result.input = turn_result.original_input
                 if isinstance(turn_result.next_step, NextStepHandoff):
                     streamed_result._original_input = copy_input_items(turn_result.original_input)
@@ -1071,6 +1133,17 @@ async def start_streaming(
                 )
                 turn_session_items = session_items_for_turn(turn_result)
                 streamed_result.new_items.extend(turn_session_items)
+                if turn_result.nested_history_owned_items is not None:
+                    owned_refs = reconcile_nested_history_owned_session_item_refs(
+                        streamed_result.new_items,
+                        streamed_result._nested_history_owned_session_item_refs,
+                        input_before_turn_rewrite,
+                        turn_result.original_input,
+                        turn_result.nested_history_owned_items,
+                    )
+                    streamed_result._nested_history_owned_session_item_refs = owned_refs
+                    if run_state is not None:
+                        run_state._nested_history_owned_session_item_refs = list(owned_refs)
                 streamed_result._replay_from_model_input_items = list(
                     streamed_result._model_input_items
                 ) != list(streamed_result.new_items)
@@ -1168,7 +1241,14 @@ async def start_streaming(
                         current_span,
                         SpanError(
                             message="Error in agent run",
-                            data={"error": str(e)},
+                            data={
+                                "error": _error_tracing.get_trace_error(
+                                    trace_include_sensitive_data=(
+                                        run_config.trace_include_sensitive_data
+                                    ),
+                                    error_message=str(e),
+                                )
+                            },
                         ),
                     )
                 raise
@@ -1191,7 +1271,12 @@ async def start_streaming(
                 current_span,
                 SpanError(
                     message="Error in agent run",
-                    data={"error": str(e)},
+                    data={
+                        "error": _error_tracing.get_trace_error(
+                            trace_include_sensitive_data=run_config.trace_include_sensitive_data,
+                            error_message=str(e),
+                        )
+                    },
                 ),
             )
         streamed_result.is_complete = True
@@ -1200,6 +1285,7 @@ async def start_streaming(
     else:
         streamed_result.is_complete = True
     finally:
+        await cleanup_models_after_run(tool_use_tracker)
         _sync_conversation_tracking_from_tracker()
         if streamed_result._input_guardrails_task:
             try:
@@ -1217,7 +1303,7 @@ async def start_streaming(
                         raise InputGuardrailTripwireTriggered(first_trigger)
             except Exception as e:
                 logger.debug(
-                    f"Error in streamed_result finalize for agent {current_agent.name} - {e}"
+                    "Error in streamed_result finalize for agent %s - %s", current_agent.name, e
                 )
         try:
             await dispose_resolved_computers(run_context=context_wrapper)
@@ -1250,7 +1336,6 @@ async def run_single_turn_streamed(
     all_tools: list[Tool],
     server_conversation_tracker: OpenAIServerConversationTracker | None = None,
     session: Session | None = None,
-    session_items_to_rewind: list[TResponseInputItem] | None = None,
     pending_server_items: list[RunItem] | None = None,
     reasoning_item_id_policy: ReasoningItemIdPolicy | None = None,
     prompt_cache_key_resolver: PromptCacheKeyResolver | None = None,
@@ -1342,6 +1427,7 @@ async def run_single_turn_streamed(
 
     handoffs = await get_handoffs(execution_agent, context_wrapper)
     model = get_model(execution_agent, run_config)
+    tool_use_tracker.record_model(model)
     model_settings = get_model_settings(execution_agent, run_config)
     model_settings = maybe_reset_tool_choice(public_agent, tool_use_tracker, model_settings)
 
@@ -1450,8 +1536,6 @@ async def run_single_turn_streamed(
     model_settings = model_settings_with_prompt_cache_key(model_settings, prompt_cache_key)
 
     async def rewind_model_request() -> None:
-        items_to_rewind = session_items_to_rewind if session_items_to_rewind is not None else []
-        await rewind_session_items(session, items_to_rewind, server_conversation_tracker)
         if server_conversation_tracker is not None:
             server_conversation_tracker.rewind_input(filtered.input)
 
@@ -1478,9 +1562,12 @@ async def run_single_turn_streamed(
         previous_response_id=previous_response_id,
         conversation_id=conversation_id,
         failed_retry_attempts_out=stream_failed_retry_attempts,
+        replay_unsafe_request=any(
+            isinstance(tool, ProgrammaticToolCallingTool) for tool in all_tools
+        ),
     )
 
-    async for event in retry_stream:
+    async for event in model_run_context_stream(retry_stream, tool_use_tracker):
         streamed_result._event_queue.put_nowait(RawResponsesStreamEvent(data=event))
 
         terminal_response: Response | None = None
@@ -1506,14 +1593,7 @@ async def run_single_turn_streamed(
                 terminal_response.output = list(streamed_response_output)
             usage = (
                 apply_retry_attempt_usage(
-                    Usage(
-                        requests=1,
-                        input_tokens=terminal_response.usage.input_tokens,
-                        output_tokens=terminal_response.usage.output_tokens,
-                        total_tokens=terminal_response.usage.total_tokens,
-                        input_tokens_details=terminal_response.usage.input_tokens_details,
-                        output_tokens_details=terminal_response.usage.output_tokens_details,
-                    ),
+                    _response_usage_to_usage(terminal_response.usage),
                     stream_failed_retry_attempts[0],
                 )
                 if terminal_response.usage
@@ -1826,6 +1906,7 @@ async def get_new_response(
         filtered.input = deduplicate_input_items_preferring_latest(filtered.input)
 
     model = get_model(execution_agent, run_config)
+    tool_use_tracker.record_model(model)
     model_settings = get_model_settings(execution_agent, run_config)
     model_settings = maybe_reset_tool_choice(public_agent, tool_use_tracker, model_settings)
 
@@ -1879,27 +1960,31 @@ async def get_new_response(
         if server_conversation_tracker is not None:
             server_conversation_tracker.rewind_input(filtered.input)
 
-    new_response = await get_response_with_retry(
-        get_response=lambda: model.get_response(
-            system_instructions=filtered.instructions,
-            input=filtered.input,
-            model_settings=model_settings,
-            tools=all_tools,
-            output_schema=output_schema,
-            handoffs=handoffs,
-            tracing=get_model_tracing_impl(
-                run_config.tracing_disabled, run_config.trace_include_sensitive_data
+    with model_run_context(tool_use_tracker):
+        new_response = await get_response_with_retry(
+            get_response=lambda: model.get_response(
+                system_instructions=filtered.instructions,
+                input=filtered.input,
+                model_settings=model_settings,
+                tools=all_tools,
+                output_schema=output_schema,
+                handoffs=handoffs,
+                tracing=get_model_tracing_impl(
+                    run_config.tracing_disabled, run_config.trace_include_sensitive_data
+                ),
+                previous_response_id=previous_response_id,
+                conversation_id=conversation_id,
+                prompt=prompt_config,
             ),
+            rewind=rewind_model_request,
+            retry_settings=model_settings.retry,
+            get_retry_advice=model.get_retry_advice,
             previous_response_id=previous_response_id,
             conversation_id=conversation_id,
-            prompt=prompt_config,
-        ),
-        rewind=rewind_model_request,
-        retry_settings=model_settings.retry,
-        get_retry_advice=model.get_retry_advice,
-        previous_response_id=previous_response_id,
-        conversation_id=conversation_id,
-    )
+            replay_unsafe_request=any(
+                isinstance(tool, ProgrammaticToolCallingTool) for tool in all_tools
+            ),
+        )
     if server_conversation_tracker is not None:
         # Retry helpers rewind sent-input tracking before replaying a failed request. Mark the
         # filtered input as delivered again once a retry succeeds so subsequent turns only send

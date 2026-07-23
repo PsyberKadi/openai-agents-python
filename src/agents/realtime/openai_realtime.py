@@ -6,9 +6,9 @@ import inspect
 import json
 import math
 import os
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Annotated, Any, Literal, TypeAlias, cast
 
 import pydantic
@@ -57,6 +57,7 @@ from openai.types.realtime.realtime_conversation_item_user_message import (
 from openai.types.realtime.realtime_function_tool import (
     RealtimeFunctionTool as OpenAISessionFunction,
 )
+from openai.types.realtime.realtime_response_usage import RealtimeResponseUsage
 from openai.types.realtime.realtime_server_event import (
     RealtimeServerEvent as OpenAIRealtimeServerEvent,
 )
@@ -96,17 +97,21 @@ from agents.tool import (
 )
 from agents.util._types import MaybeAwaitable
 
+from .. import _debug
 from ..exceptions import UserError
 from ..logger import logger
 from ..run_context import RunContextWrapper, TContext
+from ..usage import Usage
 from ..version import __version__
+from ._tool_filtering import filter_enabled_tools, filter_statically_enabled_tools
+from ._tool_validation import validate_realtime_tool_names
 from .agent import RealtimeAgent
 from .config import (
     RealtimeModelTracingConfig,
     RealtimeRunConfig,
     RealtimeSessionModelSettings,
 )
-from .handoffs import realtime_handoff
+from .handoffs import collect_enabled_handoffs, filter_enabled_handoffs
 from .items import RealtimeMessageItem, RealtimeToolCallItem
 from .model import (
     RealtimeModel,
@@ -119,18 +124,22 @@ from .model_events import (
     RealtimeModelAudioDoneEvent,
     RealtimeModelAudioEvent,
     RealtimeModelAudioInterruptedEvent,
+    RealtimeModelCachedTokensDetails,
     RealtimeModelErrorEvent,
     RealtimeModelEvent,
     RealtimeModelExceptionEvent,
     RealtimeModelInputAudioTimeoutTriggeredEvent,
     RealtimeModelInputAudioTranscriptionCompletedEvent,
+    RealtimeModelInputTokensDetails,
     RealtimeModelItemDeletedEvent,
     RealtimeModelItemUpdatedEvent,
+    RealtimeModelOutputTokensDetails,
     RealtimeModelRawServerEvent,
     RealtimeModelToolCallEvent,
     RealtimeModelTranscriptDeltaEvent,
     RealtimeModelTurnEndedEvent,
     RealtimeModelTurnStartedEvent,
+    RealtimeModelUsageEvent,
 )
 from .model_inputs import (
     RealtimeModelSendAudio,
@@ -152,7 +161,7 @@ OpenAIRealtimeAudioOutput = _rt_audio_config.RealtimeAudioConfigOutput  # type: 
 
 
 _USER_AGENT = f"Agents/Python {__version__}"
-DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
+DEFAULT_REALTIME_MODEL = "gpt-realtime-2.1"
 
 DEFAULT_MODEL_SETTINGS: RealtimeSessionModelSettings = {
     "voice": "ash",
@@ -184,6 +193,36 @@ AllRealtimeServerEvents = Annotated[
 ]
 
 ServerEventTypeAdapter: TypeAdapter[AllRealtimeServerEvents] | None = None
+
+
+def _server_event_validation_summary(error: BaseException) -> str:
+    if isinstance(error, pydantic.ValidationError):
+        return f"{error.error_count()} validation error(s)"
+
+    return error.__class__.__name__
+
+
+def _server_event_identity(event: Any) -> tuple[Any, Any]:
+    if not isinstance(event, dict):
+        return "unknown", None
+
+    return event.get("type", "unknown"), event.get("event_id")
+
+
+def _log_server_event_validation_failure(event: Any, error: BaseException) -> str:
+    event_type, event_id = _server_event_identity(event)
+
+    if _debug.DONT_LOG_MODEL_DATA:
+        logger.error(
+            "Failed to validate server event type=%s event_id=%s: %s",
+            event_type,
+            event_id,
+            _server_event_validation_summary(error),
+        )
+    else:
+        logger.error("Failed to validate server event: %s", event, exc_info=True)
+
+    return str(event_type)
 
 
 @dataclass(frozen=True)
@@ -370,27 +409,43 @@ def get_server_event_type_adapter() -> TypeAdapter[AllRealtimeServerEvents]:
     return ServerEventTypeAdapter
 
 
+_SERVER_EVENT_TYPES_WITH_CUSTOM_VOICE = frozenset(
+    {
+        "session.created",
+        "session.updated",
+        "response.created",
+        "response.done",
+    }
+)
+
+
+def _should_normalize_custom_voice_for_server_event(event: Any) -> bool:
+    return isinstance(event, dict) and event.get("type") in _SERVER_EVENT_TYPES_WITH_CUSTOM_VOICE
+
+
+def _normalize_custom_voice_for_server_event_validation(value: Any) -> Any:
+    # TODO: Remove this once generated Realtime server event models accept custom voice objects.
+    if isinstance(value, list):
+        return [_normalize_custom_voice_for_server_event_validation(item) for item in value]
+
+    if not isinstance(value, dict):
+        return value
+
+    normalized: dict[str, Any] = {}
+    for key, item in value.items():
+        if key == "voice" and isinstance(item, Mapping):
+            voice_id = item.get("id")
+            if isinstance(voice_id, str):
+                normalized[key] = voice_id
+                continue
+        normalized[key] = _normalize_custom_voice_for_server_event_validation(item)
+    return normalized
+
+
 async def _collect_enabled_handoffs(
     agent: RealtimeAgent[Any], context_wrapper: RunContextWrapper[Any]
 ) -> list[Handoff[Any, RealtimeAgent[Any]]]:
-    handoffs: list[Handoff[Any, RealtimeAgent[Any]]] = []
-    for handoff_item in agent.handoffs:
-        if isinstance(handoff_item, Handoff):
-            handoffs.append(handoff_item)
-        elif isinstance(handoff_item, RealtimeAgent):
-            handoffs.append(realtime_handoff(handoff_item))
-
-    async def _check_handoff_enabled(handoff_obj: Handoff[Any, RealtimeAgent[Any]]) -> bool:
-        attr = handoff_obj.is_enabled
-        if isinstance(attr, bool):
-            return attr
-        res = attr(context_wrapper, agent)
-        if inspect.isawaitable(res):
-            return await res
-        return res
-
-    results = await asyncio.gather(*(_check_handoff_enabled(h) for h in handoffs))
-    return [h for h, ok in zip(handoffs, results, strict=False) if ok]
+    return await collect_enabled_handoffs(agent, context_wrapper)
 
 
 async def _build_model_settings_from_agent(
@@ -417,6 +472,18 @@ async def _build_model_settings_from_agent(
 
     if starting_settings:
         updated_settings.update(starting_settings)
+        if "tools" in starting_settings:
+            updated_settings["tools"] = await filter_enabled_tools(
+                updated_settings.get("tools") or [],
+                context_wrapper,
+                agent,
+            )
+        if "handoffs" in starting_settings:
+            updated_settings["handoffs"] = await filter_enabled_handoffs(
+                updated_settings.get("handoffs") or [],
+                context_wrapper,
+                agent,
+            )
 
     if run_config and run_config.get("tracing_disabled", False):
         updated_settings["tracing"] = None
@@ -437,6 +504,11 @@ class TransportConfig(TypedDict):
 
     handshake_timeout: NotRequired[float]
     """Time in seconds to wait for the connection handshake to complete."""
+
+    max_size: NotRequired[int | None]
+    """Maximum size in bytes of an incoming websocket message.
+    Defaults to None (no limit). Set an explicit byte limit to bound memory usage for
+    long-lived connections behind proxies or in memory-constrained containers."""
 
 
 class OpenAIRealtimeWebSocketModel(RealtimeModel):
@@ -556,6 +628,8 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                 connect_kwargs["ping_timeout"] = transport_config["ping_timeout"]
             if "handshake_timeout" in transport_config:
                 connect_kwargs["open_timeout"] = transport_config["handshake_timeout"]
+            if "max_size" in transport_config:
+                connect_kwargs["max_size"] = transport_config["max_size"]
 
         return await websockets.connect(url, **connect_kwargs)
 
@@ -646,8 +720,10 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                     )
                 else:
                     await self._send_raw_message(converted)
+            elif _debug.DONT_LOG_MODEL_DATA:
+                logger.error("Failed to convert raw message type=%s", event.message.get("type"))
             else:
-                logger.error(f"Failed to convert raw message: {event}")
+                logger.error("Failed to convert raw message: %s", event)
         elif isinstance(event, RealtimeModelSendUserInput):
             await self._send_user_input(event)
         elif isinstance(event, RealtimeModelSendAudio):
@@ -822,9 +898,7 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
             item_id, item_content_index = last_audio_item_id
             audio_state = self._audio_state_tracker.get_state(item_id, item_content_index)
             if audio_state:
-                elapsed_ms = (
-                    datetime.now() - audio_state.initial_received_time
-                ).total_seconds() * 1000
+                elapsed_ms = (time.monotonic() - audio_state.initial_received_time) * 1000
                 return {
                     "current_item_id": item_id,
                     "current_item_content_index": item_content_index,
@@ -852,10 +926,10 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
 
         if current_item_id is None or elapsed_ms is None:
             logger.debug(
-                "Skipping interrupt. "
-                f"Item id: {current_item_id}, "
-                f"elapsed ms: {elapsed_ms}, "
-                f"content index: {current_item_content_index}"
+                "Skipping interrupt. Item id: %s, elapsed ms: %s, content index: %s",
+                current_item_id,
+                elapsed_ms,
+                current_item_content_index,
             )
         else:
             current_item_content_index = current_item_content_index or 0
@@ -880,10 +954,11 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                     await self._send_raw_message(converted)
             else:
                 logger.debug(
-                    "Didn't interrupt bc elapsed ms is < 0. "
-                    f"Item id: {current_item_id}, "
-                    f"elapsed ms: {elapsed_ms}, "
-                    f"content index: {current_item_content_index}"
+                    "Didn't interrupt bc elapsed ms is < 0. Item id: %s, "
+                    "elapsed ms: %s, content index: %s",
+                    current_item_id,
+                    elapsed_ms,
+                    current_item_content_index,
                 )
 
         session = self._created_session
@@ -1054,14 +1129,20 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         try:
             if "previous_item_id" in event and event["previous_item_id"] is None:
                 event["previous_item_id"] = ""  # TODO (rm) remove
-            parsed: AllRealtimeServerEvents = self._server_event_type_adapter.validate_python(event)
+            validation_event = (
+                _normalize_custom_voice_for_server_event_validation(event)
+                if _should_normalize_custom_voice_for_server_event(event)
+                else event
+            )
+            parsed: AllRealtimeServerEvents = self._server_event_type_adapter.validate_python(
+                validation_event
+            )
         except pydantic.ValidationError as e:
-            logger.error(f"Failed to validate server event: {event}", exc_info=True)
+            _log_server_event_validation_failure(event, e)
             await self._emit_event(RealtimeModelErrorEvent(error=e))
             return
         except Exception as e:
-            event_type = event.get("type", "unknown") if isinstance(event, dict) else "unknown"
-            logger.error(f"Failed to validate server event: {event}", exc_info=True)
+            event_type = _log_server_event_validation_failure(event, e)
             exception_event = RealtimeModelExceptionEvent(
                 exception=e,
                 context=f"Failed to validate server event: {event_type}",
@@ -1109,11 +1190,12 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                         and not self._ongoing_response
                     ):
                         logger.debug(
-                            "Skipping truncate because playback appears complete. "
-                            f"Item id: {playback_item_id}, "
-                            f"elapsed ms: {effective_elapsed_ms}, "
-                            f"content index: {playback_content_index}, "
-                            f"audio length ms: {max_audio_ms}"
+                            "Skipping truncate because playback appears complete. Item id: %s, "
+                            "elapsed ms: %s, content index: %s, audio length ms: %s",
+                            playback_item_id,
+                            effective_elapsed_ms,
+                            playback_content_index,
+                            max_audio_ms,
                         )
                     else:
                         if max_audio_ms is not None:
@@ -1149,6 +1231,10 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
             await self._emit_event(RealtimeModelTurnStartedEvent())
         elif parsed.type == "response.done":
             await self._mark_response_done()
+            if parsed.response.usage is not None:
+                await self._emit_event(
+                    _ConversionHelper.convert_response_usage(parsed.response.usage)
+                )
             await self._emit_event(RealtimeModelTurnEndedEvent())
         elif parsed.type == "session.created":
             await self._send_tracing_config(self._tracing_config)
@@ -1493,7 +1579,9 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
         self, tools: list[Tool], handoffs: list[Handoff]
     ) -> list[OpenAISessionFunction]:
         converted_tools: list[OpenAISessionFunction] = []
-        for tool in tools:
+        enabled_tools = filter_statically_enabled_tools(tools)
+        enabled_handoffs = [handoff for handoff in handoffs if handoff.is_enabled is not False]
+        for tool in enabled_tools:
             if not isinstance(tool, FunctionTool):
                 raise UserError(f"Tool {tool.name} is unsupported. Must be a function tool.")
             ensure_function_tool_supports_responses_only_features(
@@ -1509,7 +1597,9 @@ class OpenAIRealtimeWebSocketModel(RealtimeModel):
                 )
             )
 
-        for handoff in handoffs:
+        validate_realtime_tool_names(enabled_tools, enabled_handoffs)
+
+        for handoff in enabled_handoffs:
             converted_tools.append(
                 OpenAISessionFunction(
                     name=handoff.tool_name,
@@ -1557,6 +1647,18 @@ class OpenAIRealtimeSIPModel(OpenAIRealtimeWebSocketModel):
 
         if overrides:
             merged_settings.update(overrides)
+            if "tools" in overrides:
+                merged_settings["tools"] = await filter_enabled_tools(
+                    merged_settings.get("tools") or [],
+                    context_wrapper,
+                    agent,
+                )
+            if "handoffs" in overrides:
+                merged_settings["handoffs"] = await filter_enabled_handoffs(
+                    merged_settings.get("handoffs") or [],
+                    context_wrapper,
+                    agent,
+                )
 
         model = OpenAIRealtimeWebSocketModel()
         return model._get_session_config(merged_settings)
@@ -1571,6 +1673,58 @@ class OpenAIRealtimeSIPModel(OpenAIRealtimeWebSocketModel):
 
 
 class _ConversionHelper:
+    @classmethod
+    def convert_response_usage(cls, usage: RealtimeResponseUsage) -> RealtimeModelUsageEvent:
+        input_tokens = usage.input_tokens or 0
+        output_tokens = usage.output_tokens or 0
+        total_tokens = (
+            usage.total_tokens if usage.total_tokens is not None else input_tokens + output_tokens
+        )
+
+        input_details = usage.input_token_details
+        output_details = usage.output_token_details
+
+        aggregate_usage = Usage(
+            requests=1,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
+        if input_details is not None:
+            aggregate_usage.input_tokens_details.cached_tokens = input_details.cached_tokens or 0
+
+        cached_details = input_details.cached_tokens_details if input_details is not None else None
+        return RealtimeModelUsageEvent(
+            usage=aggregate_usage,
+            input_tokens_details=(
+                RealtimeModelInputTokensDetails(
+                    text_tokens=input_details.text_tokens,
+                    audio_tokens=input_details.audio_tokens,
+                    image_tokens=input_details.image_tokens,
+                    cached_tokens=input_details.cached_tokens,
+                    cached_tokens_details=(
+                        RealtimeModelCachedTokensDetails(
+                            text_tokens=cached_details.text_tokens,
+                            audio_tokens=cached_details.audio_tokens,
+                            image_tokens=cached_details.image_tokens,
+                        )
+                        if cached_details is not None
+                        else None
+                    ),
+                )
+                if input_details is not None
+                else None
+            ),
+            output_tokens_details=(
+                RealtimeModelOutputTokensDetails(
+                    text_tokens=output_details.text_tokens,
+                    audio_tokens=output_details.audio_tokens,
+                )
+                if output_details is not None
+                else None
+            ),
+        )
+
     @classmethod
     def conversation_item_to_realtime_message_item(
         cls, item: ConversationItem, previous_item_id: str | None
