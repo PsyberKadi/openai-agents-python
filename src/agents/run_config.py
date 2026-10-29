@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+import inspect
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Generic, Literal
 
+from pydantic import TypeAdapter
 from typing_extensions import NotRequired, TypedDict
 
+from ._config_coercion import (
+    _declared_dataclass_type,
+    coerce_dataclass_config,
+    coerce_pydantic_config,
+)
 from .guardrail import InputGuardrail, OutputGuardrail
 from .handoffs import HandoffHistoryMapper, HandoffInputFilter
 from .items import TResponseInputItem
 from .lifecycle import RunHooks
 from .memory import Session, SessionInputCallback, SessionSettings
-from .model_settings import ModelSettings
+from .memory.session_settings import (
+    _coerce_session_settings,
+    _declared_session_settings_type,
+)
+from .model_settings import ModelSettings, _coerce_model_settings, _declared_model_settings_type
 from .models.interface import Model, ModelProvider
 from .models.multi_provider import MultiProvider
 from .run_context import TContext
@@ -64,13 +76,14 @@ class CallModelData(Generic[TContext]):
 CallModelInputFilter = Callable[[CallModelData[Any]], MaybeAwaitable[ModelInputData]]
 ReasoningItemIdPolicy = Literal["preserve", "omit"]
 ToolNotFoundBehavior = Literal["raise_error", "return_error_to_model"]
+ToolNameCollisionPolicy = Literal["warn", "error"]
 
 
 @dataclass
 class ToolErrorFormatterArgs(Generic[TContext]):
     """Data passed to ``RunConfig.tool_error_formatter`` callbacks."""
 
-    kind: Literal["approval_rejected", "tool_not_found"]
+    kind: Literal["approval_rejected", "tool_not_found", "tool_exception"]
     """The category of tool error being formatted."""
 
     tool_type: Literal["function", "computer", "shell", "apply_patch", "custom"]
@@ -88,8 +101,42 @@ class ToolErrorFormatterArgs(Generic[TContext]):
     run_context: RunContextWrapper[TContext]
     """The active run context for the current execution."""
 
+    error: Exception | None = None
+    """The original exception for ``tool_exception``; otherwise ``None``.
+
+    This exception can contain sensitive data. Return only application-approved details;
+    the SDK does not include the original exception in handled-error traces for this policy.
+    """
+
 
 ToolErrorFormatter = Callable[[ToolErrorFormatterArgs[Any]], MaybeAwaitable[str | None]]
+
+
+@dataclass
+class OutputGuardrailBlockedMessageArgs(Generic[TContext]):
+    """Data passed to output guardrail blocked-message formatters."""
+
+    default_message: str
+    """The SDK default data-free placeholder."""
+
+    guardrail_name: str
+    """The name of the output guardrail that triggered the tripwire."""
+
+    agent: Agent[Any]
+    """The agent whose final output was rejected."""
+
+    run_context: RunContextWrapper[TContext]
+    """The active run context wrapper."""
+
+
+# Keep this formatter synchronous. It runs after a terminal tool output is rejected but before
+# every replay and persistence owner is rebuilt with the data-free replacement. Awaiting
+# application code at that boundary can leave the rejected output reachable through cancellation
+# traceback locals or partially sanitized state. Async support therefore requires a redesign of
+# the redaction boundary, not merely awaiting the formatter result here.
+OutputGuardrailBlockedMessageFormatter = Callable[
+    [OutputGuardrailBlockedMessageArgs[Any]], str | None
+]
 
 
 @dataclass
@@ -192,7 +239,11 @@ class SandboxRunConfig:
     """Explicit sandbox session state to resume from when not using `RunState` payloads."""
 
     manifest: Manifest | None = None
-    """Optional sandbox manifest override for fresh session creation."""
+    """Optional sandbox manifest override for fresh session creation.
+
+    Dictionary inputs cannot authorize local host sources or extra path grants. Configure
+    these on a trusted `Manifest` instance after validating the host paths in application code.
+    """
 
     snapshot: SnapshotSpec | SnapshotBase | None = None
     """Optional sandbox snapshot used for fresh session creation."""
@@ -206,6 +257,104 @@ class SandboxRunConfig:
     Set to `None` to preserve the default behavior with no SDK archive resource limits.
     Use `SandboxArchiveLimits()` to enable SDK defaults.
     """
+
+    cwd: str | PurePath | None = None
+    """Optional model-facing working directory relative to the sandbox workspace root.
+
+    Relative paths used by the built-in `exec_command`, `view_image`, and `apply_patch` tools
+    resolve from this directory. Custom path-bearing capabilities must apply their bound
+    `SandboxWorkspaceScope` explicitly. The directory must exist and be accessible to the
+    configured sandbox user when the runner validates `cwd`; for a fresh session, the runner
+    materializes the manifest before that validation.
+    This setting changes relative-path resolution only. It does not confine the run to `cwd`,
+    prevent access to other paths allowed by the shared session's workspace policy, change
+    `Manifest.root`, or change direct `BaseSandboxSession` path behavior.
+    """
+
+    if TYPE_CHECKING:
+
+        def __init__(
+            self,
+            client: BaseSandboxClient[Any] | None = None,
+            options: Any | None = None,
+            session: BaseSandboxSession | None = None,
+            session_state: SandboxSessionState | None = None,
+            manifest: Manifest | dict[str, Any] | None = None,
+            snapshot: SnapshotSpec | SnapshotBase | dict[str, Any] | None = None,
+            concurrency_limits: SandboxConcurrencyLimits | dict[str, Any] = ...,
+            archive_limits: SandboxArchiveLimits | dict[str, Any] | None = None,
+            cwd: str | PurePath | None = None,
+        ) -> None: ...
+
+    def __post_init__(self) -> None:
+        if self.cwd is not None:
+            from .sandbox.workspace_paths import normalize_sandbox_cwd
+
+            self.cwd = normalize_sandbox_cwd(self.cwd).as_posix()
+        if isinstance(self.manifest, dict):
+            from .sandbox.manifest import _coerce_manifest
+
+            self.manifest = _coerce_manifest(self.manifest, parameter_name="sandbox.manifest")
+        if isinstance(self.snapshot, dict):
+            from .sandbox.snapshot import SnapshotBase, SnapshotSpecUnion
+
+            if "id" in self.snapshot:
+                self.snapshot = SnapshotBase.parse(self.snapshot)
+            else:
+                self.snapshot = TypeAdapter(SnapshotSpecUnion).validate_python(self.snapshot)
+        if isinstance(self.options, dict) and self.client is not None:
+            from .sandbox.session.sandbox_client import BaseSandboxClientOptions
+
+            options_type = BaseSandboxClientOptions._options_class_for_type(self.client.backend_id)
+            if options_type is not None:
+                options = self.options
+                explicit_type = options.get("type")
+                if explicit_type is not None and explicit_type != self.client.backend_id:
+                    raise ValueError(
+                        f"sandbox.options type `{explicit_type}` does not match selected "
+                        f"sandbox client backend `{self.client.backend_id}`"
+                    )
+                if "type" not in options:
+                    options = {
+                        **options,
+                        "type": options_type.model_fields["type"].default,
+                    }
+                self.options = coerce_pydantic_config(
+                    options,
+                    options_type,
+                    parameter_name="sandbox.options",
+                )
+            elif self.client.backend_id == "blaxel":
+                from .extensions.sandbox.blaxel.sandbox import (
+                    BlaxelSandboxClient,
+                    BlaxelSandboxClientOptions,
+                )
+
+                if isinstance(self.client, BlaxelSandboxClient):
+                    self.options = coerce_dataclass_config(
+                        self.options,
+                        BlaxelSandboxClientOptions,
+                        parameter_name="sandbox.options",
+                    )
+        self.concurrency_limits = coerce_dataclass_config(
+            self.concurrency_limits,
+            _declared_dataclass_type(
+                type(self),
+                "concurrency_limits",
+                SandboxConcurrencyLimits,
+            ),
+            parameter_name="sandbox.concurrency_limits",
+        )
+        if self.archive_limits is not None:
+            self.archive_limits = coerce_dataclass_config(
+                self.archive_limits,
+                _declared_dataclass_type(
+                    type(self),
+                    "archive_limits",
+                    SandboxArchiveLimits,
+                ),
+                parameter_name="sandbox.archive_limits",
+            )
 
 
 @dataclass
@@ -222,7 +371,7 @@ class RunConfig:
 
     model_settings: ModelSettings | None = None
     """Configure global model settings. Any non-null values will override the agent-specific model
-    settings.
+    settings. Accepts a ``ModelSettings`` instance or a dictionary containing its fields.
     """
 
     handoff_input_filter: HandoffInputFilter | None = None
@@ -237,6 +386,12 @@ class RunConfig:
     """Opt-in beta: compact prior run history into ordered assistant summary segments while
     preserving lossless message items in their original positions. This is disabled by default
     while we stabilize nested handoffs; set to True to enable the compacted transcript behavior.
+    Nesting does not redact sensitive data: tool arguments and outputs can remain in summary text.
+    An explicit `Handoff.input_filter` or `RunConfig.handoff_input_filter` replaces automatic
+    nesting, even when this setting is True. To filter and nest history, the custom filter must
+    call `agents.handoffs.nest_handoff_history` itself. Sanitize `input_history`,
+    `pre_handoff_items`, and `new_items` before that call, or sanitize its returned `input_history`.
+    The helper ignores an existing `input_items` override when building nested history.
     Server-managed conversations
     (`conversation_id`, `previous_response_id`, or `auto_previous_response_id`) automatically
     disable this behavior with a warning.
@@ -311,6 +466,15 @@ class RunConfig:
     """Optional callback that formats tool error messages returned to the model.
 
     Returning ``None`` falls back to the SDK default message.
+
+    For ordinary function-tool exceptions, this callback applies only when the tool uses
+    the implicit default failure handler. Explicit per-tool handlers, including ``None``
+    (propagate errors), take precedence. Tools created by ``Agent.as_tool()`` and local MCP
+    factories retain their existing ``failure_error_function`` policies; this callback
+    does not format their exceptions. Timeouts, cancellation, and schema-backed
+    program-call failures retain their existing policies. A callback failure falls back
+    to the default message. Returned messages may enter model input, history, and traces;
+    return only application-approved details.
     """
 
     session_settings: SessionSettings | None = None
@@ -339,6 +503,100 @@ class RunConfig:
       the run continue.
     """
 
+    tool_name_collision_policy: ToolNameCollisionPolicy = "warn"
+    """Controls collisions between function tool and handoff names.
+
+    - ``"warn"`` logs an actionable warning and exposes only the current dispatch winner.
+    - ``"error"`` raises ``UserError`` before the model is called.
+
+    Existing strict validation for namespaced and deferred-loading tools is unchanged.
+    """
+
+    output_guardrail_blocked_message: str | OutputGuardrailBlockedMessageFormatter | None = None
+    """Customize the data-free placeholder retained for terminal tool output rejected by an
+    output guardrail.
+
+    Pass a non-empty string or a synchronous formatter that receives safe run metadata. Returning
+    ``None`` or an invalid value, or raising from the formatter, uses the SDK default. The rejected
+    output and guardrail ``output_info`` are never passed to the formatter.
+    """
+
+    if TYPE_CHECKING:
+
+        def __init__(
+            self,
+            model: str | Model | None = None,
+            model_provider: ModelProvider = ...,
+            model_settings: ModelSettings | dict[str, Any] | None = None,
+            handoff_input_filter: HandoffInputFilter | None = None,
+            nest_handoff_history: bool = False,
+            handoff_history_mapper: HandoffHistoryMapper | None = None,
+            input_guardrails: list[InputGuardrail[Any]] | None = None,
+            output_guardrails: list[OutputGuardrail[Any]] | None = None,
+            tracing_disabled: bool = False,
+            tracing: TracingConfig | None = None,
+            trace_include_sensitive_data: bool = ...,
+            workflow_name: str = "Agent workflow",
+            trace_id: str | None = None,
+            group_id: str | None = None,
+            trace_metadata: dict[str, Any] | None = None,
+            session_input_callback: SessionInputCallback | None = None,
+            call_model_input_filter: CallModelInputFilter | None = None,
+            tool_error_formatter: ToolErrorFormatter | None = None,
+            session_settings: SessionSettings | dict[str, Any] | None = None,
+            reasoning_item_id_policy: ReasoningItemIdPolicy | None = None,
+            sandbox: SandboxRunConfig | dict[str, Any] | None = None,
+            tool_execution: ToolExecutionConfig | dict[str, Any] | None = None,
+            tool_not_found_behavior: ToolNotFoundBehavior = "raise_error",
+            tool_name_collision_policy: ToolNameCollisionPolicy = "warn",
+            output_guardrail_blocked_message: (
+                str | OutputGuardrailBlockedMessageFormatter | None
+            ) = None,
+        ) -> None: ...
+
+    def __post_init__(self) -> None:
+        if self.tool_name_collision_policy not in ("warn", "error"):
+            raise ValueError("tool_name_collision_policy must be either 'warn' or 'error'")
+        blocked_message = self.output_guardrail_blocked_message
+        if type(blocked_message) is str:
+            if not blocked_message:
+                raise ValueError("output_guardrail_blocked_message must be non-empty")
+        elif isinstance(blocked_message, str):
+            raise TypeError(
+                "output_guardrail_blocked_message must be a built-in string, callable, or None"
+            )
+        elif blocked_message is not None and not callable(blocked_message):
+            raise TypeError("output_guardrail_blocked_message must be a string, callable, or None")
+        elif inspect.iscoroutinefunction(blocked_message):
+            raise TypeError("output_guardrail_blocked_message formatter must be synchronous")
+        if self.model_settings is not None:
+            self.model_settings = _coerce_model_settings(
+                self.model_settings,
+                parameter_name="RunConfig model_settings",
+                model_settings_type=_declared_model_settings_type(type(self), "model_settings"),
+            )
+        if self.session_settings is not None:
+            self.session_settings = _coerce_session_settings(
+                self.session_settings,
+                settings_type=_declared_session_settings_type(type(self), "session_settings"),
+            )
+        if self.sandbox is not None:
+            self.sandbox = coerce_dataclass_config(
+                self.sandbox,
+                _declared_dataclass_type(type(self), "sandbox", SandboxRunConfig),
+                parameter_name="run_config.sandbox",
+            )
+        if self.tool_execution is not None:
+            self.tool_execution = coerce_dataclass_config(
+                self.tool_execution,
+                _declared_dataclass_type(
+                    type(self),
+                    "tool_execution",
+                    ToolExecutionConfig,
+                ),
+                parameter_name="run_config.tool_execution",
+            )
+
 
 class RunOptions(TypedDict, Generic[TContext]):
     """Arguments for ``AgentRunner`` methods."""
@@ -352,7 +610,7 @@ class RunOptions(TypedDict, Generic[TContext]):
     hooks: NotRequired[RunHooks[TContext] | None]
     """Lifecycle hooks for the run."""
 
-    run_config: NotRequired[RunConfig | None]
+    run_config: NotRequired[RunConfig | dict[str, Any] | None]
     """Run configuration."""
 
     previous_response_id: NotRequired[str | None]
@@ -371,11 +629,19 @@ class RunOptions(TypedDict, Generic[TContext]):
     """Error handlers keyed by error kind."""
 
 
+def _coerce_run_config(value: RunConfig | dict[str, Any]) -> RunConfig:
+    """Normalize run configuration dictionaries at public runner boundaries."""
+    return coerce_dataclass_config(value, RunConfig, parameter_name="run_config")
+
+
 __all__ = [
     "DEFAULT_MAX_TURNS",
+    "ToolNameCollisionPolicy",
     "CallModelData",
     "CallModelInputFilter",
     "ModelInputData",
+    "OutputGuardrailBlockedMessageArgs",
+    "OutputGuardrailBlockedMessageFormatter",
     "ReasoningItemIdPolicy",
     "RunConfig",
     "RunOptions",

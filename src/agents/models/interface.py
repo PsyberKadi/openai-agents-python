@@ -35,7 +35,26 @@ class ModelTracing(enum.Enum):
 
 
 class Model(abc.ABC):
-    """The base interface for calling an LLM."""
+    """The base interface for calling an LLM.
+
+    Model implementations must assign a non-empty call ID to each tool invocation. A call ID must
+    identify one canonical invocation for the lifetime of the run and its serialized resume
+    lineage; it must not be reused for changed tool identity or payload. An exact completed replay
+    may be omitted by the runtime without re-executing the invocation. Tool outputs must retain the
+    call ID for correlation.
+    """
+
+    def get_default_model_settings(self) -> ModelSettings | None:
+        """Return defaults for this model, or None to retain the agent's implicit defaults.
+
+        The default implementation recognizes adapters exposing a string ``model`` name.
+        Adapters with namespaced identifiers can override this using their canonical model name.
+        Explicit agent settings and explicit model selections take precedence over this hook.
+        """
+        from .default_models import get_default_model_settings
+
+        name = getattr(self, "model", None)
+        return get_default_model_settings(name) if isinstance(name, str) else None
 
     async def _cleanup_on_run_end(self, owner: object) -> None:
         """Release run-scoped resources after the runner finishes using this model."""

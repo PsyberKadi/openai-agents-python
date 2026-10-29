@@ -34,6 +34,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
+from ....logger import log_tool_action_warning
+from ....sandbox._mount_security import redact_mount_error_data
 from ....sandbox.entries import Mount
 from ....sandbox.errors import (
     ExecNonZeroError,
@@ -49,8 +51,10 @@ from ....sandbox.errors import (
 from ....sandbox.manifest import Manifest
 from ....sandbox.session import SandboxSession, SandboxSessionState
 from ....sandbox.session.base_sandbox_session import BaseSandboxSession
+from ....sandbox.session.bounded_read import collect_bounded
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
+from ....sandbox.session.pty_output import collect_pty_output
 from ....sandbox.session.pty_types import (
     PTY_PROCESSES_MAX,
     PTY_PROCESSES_WARNING,
@@ -59,7 +63,6 @@ from ....sandbox.session.pty_types import (
     clamp_pty_yield_time_ms,
     process_id_to_prune_from_meta,
     resolve_pty_write_yield_time_ms,
-    truncate_text_by_tokens,
 )
 from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
@@ -685,6 +688,7 @@ class _E2BPtyProcessEntry:
     output_chunks: deque[bytes] = field(default_factory=deque)
     output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     output_notify: asyncio.Event = field(default_factory=asyncio.Event)
+    output_closed: asyncio.Event = field(default_factory=asyncio.Event)
     last_used: float = field(default_factory=time.monotonic)
     exit_code: int | None = None
     wait_task: asyncio.Task[None] | None = None
@@ -858,6 +862,12 @@ class E2BSandboxSession(BaseSandboxSession):
 
     async def _shutdown_backend(self) -> None:
         # Best-effort kill of the remote sandbox.
+        def diagnostic_extra() -> dict[str, object]:
+            return {
+                "sandbox_id": self.state.sandbox_id,
+                "pause_on_exit": self.state.pause_on_exit,
+            }
+
         try:
             if self.state.pause_on_exit:
                 await _sandbox_pause(self._sandbox)
@@ -865,33 +875,27 @@ class E2BSandboxSession(BaseSandboxSession):
                 await _sandbox_kill(self._sandbox)
         except Exception as e:
             if self.state.pause_on_exit:
-                logger.warning(
+                log_tool_action_warning(
+                    logger,
                     "Failed to pause E2B sandbox on shutdown; falling back to kill.",
-                    extra={
-                        "sandbox_id": self.state.sandbox_id,
-                        "pause_on_exit": self.state.pause_on_exit,
-                    },
-                    exc_info=e,
+                    e,
+                    diagnostic_extra=diagnostic_extra,
                 )
                 try:
                     await _sandbox_kill(self._sandbox)
                 except Exception as kill_exc:
-                    logger.warning(
+                    log_tool_action_warning(
+                        logger,
                         "Failed to kill E2B sandbox after pause fallback failure.",
-                        extra={
-                            "sandbox_id": self.state.sandbox_id,
-                            "pause_on_exit": self.state.pause_on_exit,
-                        },
-                        exc_info=kill_exc,
+                        kill_exc,
+                        diagnostic_extra=diagnostic_extra,
                     )
             else:
-                logger.warning(
+                log_tool_action_warning(
+                    logger,
                     "Failed to kill E2B sandbox on shutdown.",
-                    extra={
-                        "sandbox_id": self.state.sandbox_id,
-                        "pause_on_exit": self.state.pause_on_exit,
-                    },
-                    exc_info=e,
+                    e,
+                    diagnostic_extra=diagnostic_extra,
                 )
 
     async def _exec_internal(
@@ -1048,7 +1052,7 @@ class E2BSandboxSession(BaseSandboxSession):
             )
 
         yield_time_ms = 10_000 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=clamp_pty_yield_time_ms(yield_time_ms),
             max_output_tokens=max_output_tokens,
@@ -1058,6 +1062,7 @@ class E2BSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def pty_write_stdin(
@@ -1085,7 +1090,7 @@ class E2BSandboxSession(BaseSandboxSession):
             await asyncio.sleep(0.1)
 
         yield_time_ms = 250 if yield_time_s is None else int(yield_time_s * 1000)
-        output, original_token_count = await self._collect_pty_output(
+        output, original_token_count, output_closed = await self._collect_pty_output(
             entry=entry,
             yield_time_ms=resolve_pty_write_yield_time_ms(
                 yield_time_ms=yield_time_ms, input_empty=chars == ""
@@ -1098,6 +1103,7 @@ class E2BSandboxSession(BaseSandboxSession):
             entry=entry,
             output=output,
             original_token_count=original_token_count,
+            output_closed=output_closed,
         )
 
     async def pty_terminate_all(self) -> None:
@@ -1108,6 +1114,20 @@ class E2BSandboxSession(BaseSandboxSession):
 
         for entry in entries:
             await self._terminate_pty_entry(entry)
+
+    async def _read_bounded(self, path: Path, *, max_bytes: int) -> bytes:
+        workspace_path = await self._validate_path_access(path)
+        try:
+            stream = await _sandbox_read_file(
+                self._sandbox, sandbox_path_str(workspace_path), format="stream"
+            )
+            async with cast(Any, stream) as chunks:
+                return await collect_bounded(chunks, max_bytes)
+        except _e2b_not_found_error_types():
+            raise WorkspaceReadNotFoundError(path=path) from None
+        except Exception as error:
+            retryable, _ = _e2b_provider_retryability(error)
+            raise WorkspaceArchiveReadError(path=path, retryable=retryable) from None
 
     async def read(self, path: Path, *, user: str | User | None = None) -> io.IOBase:
         if user is not None:
@@ -1197,10 +1217,10 @@ class E2BSandboxSession(BaseSandboxSession):
             path = await self._validate_path_access(path, for_write=True)
 
         if user is None and not parents:
-            parent = path.parent
-            test = await self.exec("test", "-d", str(parent), shell=False)
+            parent = sandbox_path_str(path.parent)
+            test = await self.exec("test", "-d", parent, shell=False)
             if not test.ok():
-                raise ExecNonZeroError(test, command=("test", "-d", str(parent)))
+                raise ExecNonZeroError(test, command=("test", "-d", parent))
         await self._ensure_dir(path, reason="mkdir_failed")
 
     async def _collect_pty_output(
@@ -1209,37 +1229,15 @@ class E2BSandboxSession(BaseSandboxSession):
         entry: _E2BPtyProcessEntry,
         yield_time_ms: int,
         max_output_tokens: int | None,
-    ) -> tuple[bytes, int | None]:
-        deadline = time.monotonic() + (yield_time_ms / 1000)
-        output = bytearray()
-
-        while True:
-            async with entry.output_lock:
-                while entry.output_chunks:
-                    output.extend(entry.output_chunks.popleft())
-
-            if time.monotonic() >= deadline:
-                break
-
-            if self._entry_exit_code(entry) is not None:
-                async with entry.output_lock:
-                    while entry.output_chunks:
-                        output.extend(entry.output_chunks.popleft())
-                break
-
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0:
-                break
-
-            try:
-                await asyncio.wait_for(entry.output_notify.wait(), timeout=remaining_s)
-            except asyncio.TimeoutError:
-                break
-            entry.output_notify.clear()
-
-        text = output.decode("utf-8", errors="replace")
-        truncated_text, original_token_count = truncate_text_by_tokens(text, max_output_tokens)
-        return truncated_text.encode("utf-8", errors="replace"), original_token_count
+    ) -> tuple[bytes, int | None, bool]:
+        return await collect_pty_output(
+            output_chunks=entry.output_chunks,
+            output_lock=entry.output_lock,
+            output_notify=entry.output_notify,
+            is_done=entry.output_closed.is_set,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
 
     async def _run_pty_waiter(self, entry: _E2BPtyProcessEntry) -> None:
         try:
@@ -1256,7 +1254,13 @@ class E2BSandboxSession(BaseSandboxSession):
                     entry.exit_code = int(value)
                 except (TypeError, ValueError):
                     pass
-        finally:
+        if entry.exit_code is not None:
+            # E2B delivers output through async callbacks that append under this lock.
+            # Wait behind callbacks already appending terminal bytes before publishing
+            # the close signal that authorizes collector settlement and PTY removal.
+            async with entry.output_lock:
+                pass
+            entry.output_closed.set()
             entry.output_notify.set()
 
     async def _finalize_pty_update(
@@ -1266,8 +1270,9 @@ class E2BSandboxSession(BaseSandboxSession):
         entry: _E2BPtyProcessEntry,
         output: bytes,
         original_token_count: int | None,
+        output_closed: bool,
     ) -> PtyExecUpdate:
-        exit_code = self._entry_exit_code(entry)
+        exit_code = self._entry_exit_code(entry) if output_closed else None
         live_process_id: int | None = process_id
 
         if exit_code is not None:
@@ -1290,7 +1295,7 @@ class E2BSandboxSession(BaseSandboxSession):
             return None
 
         meta: list[tuple[int, float, bool]] = [
-            (process_id, entry.last_used, self._entry_exit_code(entry) is not None)
+            (process_id, entry.last_used, entry.output_closed.is_set())
             for process_id, entry in self._pty_processes.items()
         ]
         process_id = process_id_to_prune_from_meta(meta)
@@ -1679,9 +1684,12 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
         instrumentation: Instrumentation | None = None,
         dependencies: Dependencies | None = None,
     ) -> None:
-        self._instrumentation = instrumentation or Instrumentation()
+        self._instrumentation = (
+            instrumentation if instrumentation is not None else Instrumentation()
+        )
         self._dependencies = dependencies
 
+    @redact_mount_error_data
     async def create(
         self,
         *,
@@ -1691,7 +1699,8 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
     ) -> SandboxSession:
         if options is None:
             raise ValueError("E2BSandboxClient.create requires options")
-        manifest = manifest or Manifest()
+        manifest = manifest if manifest is not None else Manifest()
+        self._validate_manifest_for_create(manifest)
 
         sandbox_type = _coerce_sandbox_type(options.sandbox_type)
 
@@ -1763,12 +1772,14 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
             raise TypeError("E2BSandboxClient.delete expects an E2BSandboxSession")
         return session
 
+    @redact_mount_error_data
     async def resume(
         self,
         state: SandboxSessionState,
     ) -> SandboxSession:
         if not isinstance(state, E2BSandboxSessionState):
             raise TypeError("E2BSandboxClient.resume expects an E2BSandboxSessionState")
+        state.assert_path_grants_rebound()
 
         sandbox_type = _coerce_sandbox_type(state.sandbox_type)
         SandboxClass = _import_sandbox_class(sandbox_type)
@@ -1808,6 +1819,7 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
                 lifecycle=_e2b_lifecycle(state.on_timeout, auto_resume=state.auto_resume),
                 mcp=state.mcp,
             )
+        if not reconnected:
             state.sandbox_id = str(_sandbox_id(sandbox))
             state.workspace_root_ready = False
 
@@ -1816,7 +1828,7 @@ class E2BSandboxClient(BaseSandboxClient[E2BSandboxClientOptions]):
         return self._wrap_session(inner, instrumentation=self._instrumentation)
 
     def deserialize_session_state(self, payload: dict[str, object]) -> SandboxSessionState:
-        return E2BSandboxSessionState.model_validate(payload)
+        return self._deserialize_session_state_payload(payload, E2BSandboxSessionState)
 
 
 __all__ = [

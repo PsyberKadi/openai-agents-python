@@ -5,12 +5,19 @@ import json
 import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace as dataclasses_replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, cast, overload
 
 from pydantic import TypeAdapter
 from typing_extensions import TypeVar
 
-from ..exceptions import ModelBehaviorError, UserError
+from ..exceptions import (
+    ModelBehaviorError,
+    UserError,
+    _detach_data_redacted_error_traceback,
+    _is_error_data_redacted,
+    _raise_data_redacted_error,
+)
 from ..items import RunItem, TResponseInputItem
 from ..run_context import RunContextWrapper, TContext
 from ..strict_schema import ensure_strict_json_schema
@@ -27,6 +34,7 @@ from .history import (
 
 if TYPE_CHECKING:
     from ..agent import Agent, AgentBase
+    from ..tool import ToolErrorFunction
 
 
 # The handoff input type is the type of data passed when the agent is called via a handoff.
@@ -37,6 +45,27 @@ TAgent = TypeVar("TAgent", bound="AgentBase[Any]", default="Agent[Any]")
 
 OnHandoffWithInput = Callable[[RunContextWrapper[Any], THandoffInput], Any]
 OnHandoffWithoutInput = Callable[[RunContextWrapper[Any]], Any]
+
+
+async def _invoke_handoff_with_redaction(
+    invoke_handoff: Callable[[RunContextWrapper[Any], str | None], Awaitable[TAgent]],
+    ctx: RunContextWrapper[Any],
+    input_json: str | None = None,
+) -> TAgent:
+    redacted_error: ModelBehaviorError | None = None
+    try:
+        return await invoke_handoff(ctx, input_json)
+    except ModelBehaviorError as error:
+        if not _is_error_data_redacted(error):
+            raise
+        _detach_data_redacted_error_traceback(error)
+        redacted_error = error
+
+    invoke_handoff = cast(Any, None)
+    ctx = cast(Any, None)
+    input_json = "<redacted>"
+    assert redacted_error is not None
+    _raise_data_redacted_error(redacted_error)
 
 
 @dataclass(frozen=True)
@@ -137,6 +166,13 @@ class Handoff(Generic[TContext, TAgent]):
     are free to modify the input history or new items as you see fit. The next agent receives the
     input history plus ``input_items`` when provided, otherwise it receives ``new_items``. Use
     ``input_items`` to filter model input while keeping ``new_items`` intact for session history.
+    The receiving agent's model receives the forwarded history. Use this filter to select content
+    that may be shared and remove or redact content that must not be shared.
+    Nested handoff history is not a redaction mechanism. ``nest_handoff_history`` builds history
+    from ``input_history``, ``pre_handoff_items``, and ``new_items``; it ignores ``input_items``.
+    Sanitize those three source fields before nesting, or sanitize the returned ``input_history``
+    before returning the nested result. The latter approach keeps the original ``new_items``
+    available for session history. Filtering only ``input_items`` does not sanitize nested history.
     IMPORTANT: in streaming mode, we will not stream anything as a result of this function. The
     items generated before will already have been streamed. Server-managed conversations
     (`conversation_id`, `previous_response_id`, or `auto_previous_response_id`) do not support
@@ -169,6 +205,22 @@ class Handoff(Generic[TContext, TAgent]):
     )
     """Weak reference to the target agent when constructed via `handoff()`."""
 
+    _default_tool_identity: tuple[str, str] | None = field(default=None, kw_only=True, repr=False)
+    """The target agent name and derived tool name when the default was used."""
+
+    failure_error_function: ToolErrorFunction | None = None
+    """Optional invocation-error formatter used by ``Runner`` (not Realtime sessions).
+
+    ``None`` preserves exception propagation. A sync or async formatter returns the tool
+    output sent to the calling agent, which can then retry or answer without transferring.
+    For a generic message, pass ``agents.default_tool_error_function``. Custom formatters
+    must return only application-approved error details and may re-raise unrecoverable errors.
+    This also handles application ``on_invoke_handoff``/``on_handoff`` exceptions; recovery
+    does not roll back callback side effects. Cancellation and formatter errors propagate.
+    Transfer hooks and input filters run only after a successful invocation and are not
+    covered by this handler.
+    """
+
     def get_transfer_message(self, agent: AgentBase[Any]) -> str:
         return json.dumps({"assistant": agent.name})
 
@@ -196,6 +248,7 @@ def handoff(
     input_filter: Callable[[HandoffInputData], HandoffInputData] | None = None,
     nest_handoff_history: bool | None = None,
     is_enabled: bool | Callable[[RunContextWrapper[Any], Agent[Any]], MaybeAwaitable[bool]] = True,
+    failure_error_function: ToolErrorFunction | None = None,
 ) -> Handoff[TContext, Agent[TContext]]: ...
 
 
@@ -210,6 +263,7 @@ def handoff(
     input_filter: Callable[[HandoffInputData], HandoffInputData] | None = None,
     nest_handoff_history: bool | None = None,
     is_enabled: bool | Callable[[RunContextWrapper[Any], Agent[Any]], MaybeAwaitable[bool]] = True,
+    failure_error_function: ToolErrorFunction | None = None,
 ) -> Handoff[TContext, Agent[TContext]]: ...
 
 
@@ -223,6 +277,7 @@ def handoff(
     input_filter: Callable[[HandoffInputData], HandoffInputData] | None = None,
     nest_handoff_history: bool | None = None,
     is_enabled: bool | Callable[[RunContextWrapper[Any], Agent[Any]], MaybeAwaitable[bool]] = True,
+    failure_error_function: ToolErrorFunction | None = None,
 ) -> Handoff[TContext, Agent[TContext]]: ...
 
 
@@ -236,6 +291,7 @@ def handoff(
     nest_handoff_history: bool | None = None,
     is_enabled: bool
     | Callable[[RunContextWrapper[Any], Agent[TContext]], MaybeAwaitable[bool]] = True,
+    failure_error_function: ToolErrorFunction | None = None,
 ) -> Handoff[TContext, Agent[TContext]]:
     """Create a handoff from an agent.
 
@@ -257,6 +313,13 @@ def handoff(
         is_enabled: Whether the handoff is enabled. Can be a bool or a callable that takes the run
             context and agent and returns whether the handoff is enabled. Disabled handoffs are
             hidden from the LLM at runtime.
+        failure_error_function: Optional sync or async invocation-error formatter for Runner.
+            None preserves exception propagation. Pass ``default_tool_error_function`` for
+            generic model-visible feedback, or a custom formatter returning application-approved
+            details. The calling agent stays active after a handled failure. Application callback
+            errors are also handled, without rolling back side effects; the formatter may re-raise
+            errors that are unsafe to recover. Cancellation, formatter errors, and errors in
+            transfer hooks or input filters propagate.
     """
 
     if input_type is not None and on_handoff is None:
@@ -279,7 +342,7 @@ def handoff(
             if len(sig.parameters) != 1:
                 raise UserError("on_handoff must take one argument: context")
 
-    async def _invoke_handoff(
+    async def _invoke_handoff_impl(
         ctx: RunContextWrapper[Any], input_json: str | None = None
     ) -> Agent[TContext]:
         if input_type is not None and type_adapter is not None:
@@ -297,6 +360,7 @@ def handoff(
                 type_adapter=type_adapter,
                 partial=False,
                 strict=True,
+                contains_tool_data=True,
             )
             input_func = cast(OnHandoffWithInput[THandoffInput], on_handoff)
             result = input_func(ctx, validated_input)
@@ -331,11 +395,13 @@ def handoff(
         tool_name=tool_name,
         tool_description=tool_description,
         input_json_schema=input_json_schema,
-        on_invoke_handoff=_invoke_handoff,
+        on_invoke_handoff=partial(_invoke_handoff_with_redaction, _invoke_handoff_impl),
         input_filter=input_filter,
         nest_handoff_history=nest_handoff_history,
         agent_name=agent.name,
+        failure_error_function=failure_error_function,
         is_enabled=_is_enabled if callable(is_enabled) else is_enabled,
+        _default_tool_identity=(agent.name, tool_name) if not tool_name_override else None,
     )
     handoff_obj._agent_ref = weakref.ref(agent)
     return handoff_obj

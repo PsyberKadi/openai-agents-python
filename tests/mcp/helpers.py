@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
+import sys
 from typing import Any
 
-from mcp import Tool as MCPTool
+from mcp import Tool as MCPToolType
 from mcp.types import (
     CallToolResult,
-    Content,
+    ContentBlock,
     GetPromptResult,
     ListPromptsResult,
     ListResourcesResult,
-    ListResourceTemplatesResult,
     PromptMessage,
     ReadResourceResult,
     TextContent,
@@ -22,9 +21,11 @@ from agents.mcp import MCPServer
 from agents.mcp.server import _UNSET, _MCPServerWithClientSession, _UnsetType
 from agents.mcp.util import MCPToolCustomDataExtractor, MCPToolMetaResolver, ToolFilter
 from agents.tool import ToolErrorFunction
+from agents.tool_guardrails import ToolInputGuardrail, ToolOutputGuardrail
 
-tee = shutil.which("tee") or ""
-assert tee, "tee not found"
+from .model_compat import ListResourceTemplatesResult, Tool as MCPTool
+
+tee = sys.executable
 
 
 # Added dummy stream classes for patching stdio_client to avoid real I/O during tests
@@ -70,13 +71,15 @@ class _TestFilterServer(_MCPServerWithClientSession):
 class FakeMCPServer(MCPServer):
     def __init__(
         self,
-        tools: list[MCPTool] | None = None,
+        tools: list[MCPToolType] | None = None,
         tool_filter: ToolFilter = None,
         server_name: str = "fake_mcp_server",
         require_approval: object | None = None,
         failure_error_function: ToolErrorFunction | None | _UnsetType = _UNSET,
         tool_meta_resolver: MCPToolMetaResolver | None = None,
         custom_data_extractor: MCPToolCustomDataExtractor | None = None,
+        tool_input_guardrails: list[ToolInputGuardrail[Any]] | None = None,
+        tool_output_guardrails: list[ToolOutputGuardrail[Any]] | None = None,
     ):
         super().__init__(
             use_structured_content=False,
@@ -84,14 +87,16 @@ class FakeMCPServer(MCPServer):
             failure_error_function=failure_error_function,
             tool_meta_resolver=tool_meta_resolver,
             custom_data_extractor=custom_data_extractor,
+            tool_input_guardrails=tool_input_guardrails,
+            tool_output_guardrails=tool_output_guardrails,
         )
-        self.tools: list[MCPTool] = tools or []
+        self.tools: list[MCPToolType] = tools or []
         self.tool_calls: list[str] = []
         self.tool_results: list[str] = []
         self.tool_metas: list[dict[str, Any] | None] = []
         self.tool_filter = tool_filter
         self._server_name = server_name
-        self._custom_content: list[Content] | None = None
+        self._custom_content: list[ContentBlock] | None = None
         self._response_meta: dict[str, Any] | None = None
 
     def add_tool(self, name: str, input_schema: dict[str, Any]):
